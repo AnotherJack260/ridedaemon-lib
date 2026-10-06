@@ -222,6 +222,9 @@ type PXCControl struct {
 
 	// The phone-to-car mirroring notification; see appstatus.go.
 	appStatus appStatusState
+	// phoneChannelWait, when non-zero, overrides defaultPhoneChannelWait. Tests shrink it;
+	// production leaves it at zero.
+	phoneChannelWait time.Duration
 	// OnAppStatus reports each ECP_P2C_APPSTATUS_BACKGROUND this session put on the
 	// wire, so a rider's log carries the mode and whether the write landed. The dash's
 	// own 0x20031 ack arrives separately, through the unhandled-response branch.
@@ -663,6 +666,9 @@ func (s *PXCControl) handleEvent(event *PXCResponse, conn net.Conn) {
 		// Named before it is answered, not after: a write that fails here produces an error whose
 		// whole value is saying WHICH channel could not be answered.
 		s.nameChannel(conn, "CAR_CTRL")
+		// Emitted so a rider's log shows which channels the dash opened at all - their
+		// absence from every export is what let phone commands go out on the wrong one.
+		s.emitEvent(*event)
 		response := &PXCResponse{Command: PxcHandshakeOk}
 		if err := s.writeResponse(response, conn, nil); err != nil {
 			s.emitError(s.connectionError(conn, PxcWriteErr, err))
@@ -670,13 +676,18 @@ func (s *PXCControl) handleEvent(event *PXCResponse, conn net.Conn) {
 		}
 		s.startChannelHeartbeat(conn, "CAR_CTRL")
 	case PxcChannelCarData:
+		// CarbitRide's P2C channel; see phoneChannel.
 		s.nameChannel(conn, "CAR_DATA")
+		s.emitEvent(*event)
 		response := &PXCResponse{Command: PxcChannelCarData + 1}
 		if err := s.writeResponse(response, conn, nil); err != nil {
 			s.emitError(s.connectionError(conn, PxcWriteErr, err))
 			return
 		}
 		s.startChannelHeartbeat(conn, "CAR_DATA")
+		// The official app's first APPSTATUS goes out as soon as this channel is up
+		// (b0.r -> ec/v -> t0.q0), before any capture is negotiated.
+		s.SendAppStatus(AppStatusBackground)
 	case PxcHudConf:
 		if s.HudConfig != nil {
 			break
@@ -706,10 +717,6 @@ func (s *PXCControl) handleEvent(event *PXCResponse, conn net.Conn) {
 			}
 			s.emitEvent(*response)
 			s.maybeScheduleProactiveQueryTime(conn)
-			// The official app sends its first APPSTATUS_BACKGROUND as soon as PXC is
-			// up (vf.s.b0()), before any capture is negotiated. This is that moment:
-			// the handshake the dash opened with has just been answered.
-			s.SendAppStatus(AppStatusBackground)
 		}
 	case PxcSpeedConf:
 		s.emitEvent(*event)
@@ -746,10 +753,7 @@ func (s *PXCControl) handleEvent(event *PXCResponse, conn net.Conn) {
 			s.emitError(&PxcError{PxcWriteErr, err, true})
 			break
 		}
-		response := &PXCResponse{Command: PxcCheckSnResult, Body: body}
-		if err := s.writeResponse(response, conn, nil); err != nil {
-			s.emitError(s.connectionError(conn, PxcWriteErr, err))
-		}
+		s.sendCheckSnResult(&PXCResponse{Command: PxcCheckSnResult, Body: body}, conn)
 	case PxcHeartbeat:
 		s.emitEvent(*event) // Necessary to indicate PXC finished
 		response := &PXCResponse{Command: PxcHeartbeatOk}

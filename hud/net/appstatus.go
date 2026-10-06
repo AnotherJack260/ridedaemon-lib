@@ -131,8 +131,8 @@ func buildAppStatusBody(screen PhoneScreen, mode int) ([]byte, error) {
 	})
 }
 
-// SendAppStatus pushes one ECP_P2C_APPSTATUS_BACKGROUND on the dash's control
-// connection. It is a no-op when the notification is not enabled, when the session is
+// SendAppStatus pushes one ECP_P2C_APPSTATUS_BACKGROUND on the phone channel, and only
+// there (see phoneChannel). It is a no-op when the notification is not enabled, when the session is
 // stopping, or when the same mode has already gone out on this session - a dash that
 // says STREAM_START twice must not be told twice that the mirror went live.
 func (s *PXCControl) SendAppStatus(mode int) {
@@ -151,13 +151,12 @@ func (s *PXCControl) SendAppStatus(mode int) {
 		return
 	}
 
-	// The same choice the page probe had to make, and for the same dashboard: this
-	// firmware never names its PXC channel, so anything that insisted on CAR_CTRL would
-	// go silent on the only panel this exists for. See controlConn.
-	conn := s.controlConn()
+	// No fallback: CarbitRide's t0.q0 returns early when its P2C socket is down, and the
+	// request channel is where a Zontes hung up on this command (issue #12).
+	conn := s.phoneChannel()
 	if conn == nil {
-		logging.Printf("PXC app status: no open PXC connection to send mode=%d on", mode)
-		s.noteAppStatus(mode, fmt.Errorf("no open PXC connection"))
+		logging.Printf("PXC app status: the dash has not opened the phone channel to send mode=%d on", mode)
+		s.noteAppStatus(mode, fmt.Errorf("the dash has not opened the phone channel (0x20000)"))
 		return
 	}
 

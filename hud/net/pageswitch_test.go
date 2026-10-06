@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-// openControlChannel gives the control a CAR_CTRL connection the probe can find, the
+// openControlChannel gives the control the dash's request channel (0x10000, CAR_CTRL), the
 // same way the dash does: by sending the handshake. The handshake's own reply is read
 // off the pipe so it does not sit in front of the probe's commands.
 func openControlChannel(t *testing.T, control *PXCControl) (client, server stdnet.Conn) {
@@ -28,7 +28,7 @@ func openControlChannel(t *testing.T, control *PXCControl) (client, server stdne
 
 func TestPageSwitchProbeIsOffByDefault(t *testing.T) {
 	control := NewPXCControl(":0", nil, nil)
-	_, server := openControlChannel(t, control)
+	_, server := openPhoneChannel(t, control)
 
 	control.StartPageSwitchProbe()
 
@@ -54,7 +54,7 @@ func TestPageSwitchProbeSendsTheThreeCommandsInOrder(t *testing.T) {
 		steps <- step
 	}
 
-	_, server := openControlChannel(t, control)
+	_, server := openPhoneChannel(t, control)
 	control.StartPageSwitchProbe()
 
 	first := readPXCResponse(t, server)
@@ -114,7 +114,7 @@ func TestPageSwitchProbeRunsOncePerSession(t *testing.T) {
 	control.SetPageSwitchProbe(true)
 	control.pageProbeSpacing = time.Millisecond
 
-	_, server := openControlChannel(t, control)
+	_, server := openPhoneChannel(t, control)
 	control.StartPageSwitchProbe()
 	control.StartPageSwitchProbe()
 
@@ -129,35 +129,7 @@ func TestPageSwitchProbeRunsOncePerSession(t *testing.T) {
 	}
 }
 
-// The QJ dashboard this probe exists for never sends PxcHandshake or PxcChannelCarData,
-// so its PXC connection is never named. Report 59A7-4A36-6C03 has twenty PXC frames and
-// not one of them names a channel: if the probe insisted on a CAR_CTRL name it would be
-// silent on exactly the dash it was written for.
-func TestPageSwitchProbeUsesAnUnnamedChannelWhenTheDashNeverHandshakes(t *testing.T) {
-	control := NewPXCControl(":0", nil, nil)
-	control.SetPageSwitchProbe(true)
-	control.pageProbeSpacing = time.Millisecond
-
-	client, server := stdnet.Pipe()
-	defer client.Close()
-	defer server.Close()
-	if err := server.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
-		t.Fatal(err)
-	}
-	// Any frame that is not the handshake leaves the connection unnamed, which is the
-	// state this dash stays in for a whole session. OTA_FTP_INFO is one of the notify
-	// frames it really does send; all that matters is that a reply registers the
-	// connection without giving it a channel name.
-	go control.handleEvent(&PXCResponse{Command: PxcOtaFtpInfo}, client)
-	readPXCResponse(t, server) // the bare cmd+1 ack
-
-	control.StartPageSwitchProbe()
-	if got := readPXCResponse(t, server); got.Command != PxcPageStatus {
-		t.Fatalf("first probe command = 0x%x, want 0x%x on the unnamed channel", got.Command, PxcPageStatus)
-	}
-}
-
-// With no PXC connection at all there is nothing to send on, and saying so is the whole
+// With no phone channel open there is nothing to send on, and saying so is the whole
 // value of the event: a silent probe and an absent one look identical in a field log.
 func TestPageSwitchProbeWithoutControlChannelReportsItself(t *testing.T) {
 	control := NewPXCControl(":0", nil, nil)
@@ -182,7 +154,7 @@ func TestStoppingDoesNotWaitForTheProbeToFinish(t *testing.T) {
 	control.SetPageSwitchProbe(true)
 	control.pageProbeSpacing = time.Minute
 
-	_, server := openControlChannel(t, control)
+	_, server := openPhoneChannel(t, control)
 	control.StartPageSwitchProbe()
 	readPXCResponse(t, server) // step 1, then the probe parks on the long spacing
 

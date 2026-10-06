@@ -70,8 +70,8 @@ const (
 	PageProbePageStatus
 	PageProbeJumpToCarPage
 	PageProbeSwitchToMainPage
-	// PageProbeNoControlChannel is emitted instead of the sequence when there is no open
-	// PXC connection at all to send it on - named or otherwise, see controlConn.
+	// PageProbeNoControlChannel is emitted instead of the sequence when the dash has not
+	// opened the phone channel to send it on - see phoneChannel.
 	PageProbeNoControlChannel
 )
 
@@ -83,41 +83,71 @@ func (s *PXCControl) SetPageSwitchProbe(enabled bool) {
 	s.pageProbe = enabled
 }
 
-// controlConn picks the connection to send the probe on: the one the dash named
-// CAR_CTRL, and failing that whichever PXC connection spoke most recently.
+// phoneChannel is the connection the dash opened with 0x20000 (named "CAR_DATA" here), or
+// nil until it has. In CarbitRide that is ECP_CONN_TYPE_P2C (h0.java): the only socket it
+// ever writes a phone-originated command on, through one queue (z.e -> x0). The 0x10000
+// socket carries the dash's own requests and the phone only answers there.
 //
-// The fallback is not defensive padding, it is the case that matters. A channel is only
-// named when the dash opens it with PxcHandshake or PxcChannelCarData, and the QJ
-// dashboard this probe exists for sends NEITHER - report 59A7-4A36-6C03 carries twenty
-// PXC frames across two sessions and not one of them is 0x10000 or 0x20000. Its very
-// first frame is CLIENT_INFO on an unnamed connection. Requiring the name would have
-// meant the probe reporting "no control channel" on the only dashboard it was written
-// for, which is how this nearly shipped.
-func (s *PXCControl) controlConn() net.Conn {
-	var named, latest net.Conn
-	var latestAt int64
+// This used to pick the 0x10000 socket, or failing that whichever one spoke last, on the
+// belief that some dashes open neither - but neither opening frame ever reached the event
+// stream, so no rider's log could have shown one. A command of ours landing where the dash
+// waits for an answer is a protocol error: a Zontes JCDZ21 hung up on 0x20030 there within
+// 18ms, five sessions out of five (MOTO-HUB issue #12).
+func (s *PXCControl) phoneChannel() net.Conn {
+	var found net.Conn
 	s.connections.Range(func(key, value any) bool {
 		state, ok := value.(*pxcConnectionState)
 		if !ok {
 			return true
 		}
-		conn, ok := key.(net.Conn)
-		if !ok {
-			return true
-		}
-		if name, _ := state.channel.Load().(string); name == "CAR_CTRL" {
-			named = conn
+		if name, _ := state.channel.Load().(string); name == "CAR_DATA" {
+			found, _ = key.(net.Conn)
 			return false
-		}
-		if at := state.lastRxNanos.Load(); at >= latestAt {
-			latestAt, latest = at, conn
 		}
 		return true
 	})
-	if named != nil {
-		return named
+	return found
+}
+
+// defaultPhoneChannelWait bounds how long CHECK_SN_RESULT waits for the phone channel.
+const defaultPhoneChannelWait = 3 * time.Second
+
+// sendCheckSnResult puts CHECK_SN_RESULT on the phone channel, where CarbitRide sends it
+// (g.java, after its own licence lookup, through the same P2C queue), waiting for the dash to
+// open that channel if it has not yet. A dash that never opens one still gets the result on
+// the request channel, as it always has, so no unit that streams today loses its answer.
+func (s *PXCControl) sendCheckSnResult(res *PXCResponse, fallback net.Conn) {
+	if s.isStopping() {
+		return
 	}
-	return latest
+	wait := defaultPhoneChannelWait
+	if s.phoneChannelWait > 0 {
+		wait = s.phoneChannelWait
+	}
+	s.wg.Add(1)
+	go func() {
+		defer s.wg.Done()
+		// ponytail: 50ms poll; a channel-opened signal if this ever has to be instant.
+		conn := s.phoneChannel()
+		for deadline := time.Now().Add(wait); conn == nil && time.Now().Before(deadline); conn = s.phoneChannel() {
+			select {
+			case <-s.quit:
+				return
+			case <-time.After(50 * time.Millisecond):
+			}
+		}
+		channel := "phone channel"
+		if conn == nil {
+			conn, channel = fallback, "request channel (no phone channel opened)"
+		}
+		err := s.writeResponse(res, conn, nil)
+		logging.Printf("PXC CHECK_SN_RESULT on the %s: err=%v", channel, err)
+		if err != nil {
+			s.emitError(s.connectionError(conn, PxcWriteErr, err))
+			return
+		}
+		s.emitEvent(*res)
+	}()
 }
 
 // StartPageSwitchProbe runs the page sequence once, in the background. Calling it
@@ -136,9 +166,9 @@ func (s *PXCControl) StartPageSwitchProbe() {
 func (s *PXCControl) runPageSwitchProbe() {
 	defer s.wg.Done()
 
-	conn := s.controlConn()
+	conn := s.phoneChannel()
 	if conn == nil {
-		logging.Printf("PXC page-switch probe: no open PXC connection to send on")
+		logging.Printf("PXC page-switch probe: the dash has not opened the phone channel to send on")
 		s.notePageProbe(PageProbeNoControlChannel, 0, nil)
 		return
 	}

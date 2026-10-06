@@ -28,6 +28,8 @@ func TestUnknownEvenPXCRequestWithBodyIsAcknowledged(t *testing.T) {
 
 func TestCheckSnSendsAckAndPositiveResult(t *testing.T) {
 	control := NewPXCControl(":0", nil, nil)
+	// No phone channel in this test, so the result falls back to this connection.
+	control.phoneChannelWait = 10 * time.Millisecond
 	responses := handlePXCEventAndReadResponses(t, control, &PXCResponse{
 		Command: PxcClientSet,
 		Body:    json.RawMessage(`{"client_set":"easy_conn","sn":"SERIAL-123"}`),
