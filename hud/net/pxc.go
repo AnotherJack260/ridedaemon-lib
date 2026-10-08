@@ -1407,11 +1407,20 @@ func (s *PXCControl) handleConn(conn net.Conn) {
 	// first and removing afterwards lets two dying channels each see the other
 	// still listed and call a real death survivable.
 	fail := func(errType PxcErrorType, cause error) {
-		if retired := state.retired.Load(); retired != nil {
+		retired := state.retired.Load()
+		if retired != nil {
 			errType, cause = PxcTimeoutErr, *retired
 		}
 		s.tracker.Remove(conn)
-		s.emitError(s.connectionError(conn, errType, cause))
+		pe := s.connectionError(conn, errType, cause)
+		if retired != nil && pe.Fatal {
+			// This side closed it (retire), not the dash: the dash reopens a phone channel as it
+			// does after a Wi-Fi blip, and a dash that really went away is still caught by the
+			// dead-dash check and by the media servers, which report on their own. Ending the
+			// session here would turn one unanswered command into a lost TFT.
+			pe = &PxcError{errType, fmt.Errorf("the last PXC channel was closed by this side; waiting for the dash to reopen it: %v", cause), false}
+		}
+		s.emitError(pe)
 	}
 
 	logging.Printf("Starting PXC Loop")

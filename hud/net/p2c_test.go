@@ -356,6 +356,31 @@ func TestAnUnansweredPhoneCommandRetiresThePhoneChannel(t *testing.T) {
 	}
 }
 
+// Retiring the last PXC channel is still this side's doing, not the dash dying, so it must not end
+// the session: the request channel already gone, an unanswered phone command closes the only one left.
+func TestRetiringTheLastPXCChannelIsNotFatal(t *testing.T) {
+	control := NewPXCControl(":0", nil, nil)
+	control.p2cTimeout.Store(int64(50 * time.Millisecond))
+	car, data := stdnet.Pipe()
+	t.Cleanup(func() { _ = car.Close(); _ = data.Close() })
+	_ = data.SetDeadline(time.Now().Add(3 * time.Second))
+	servePXCConn(t, control, car)
+	writeDashFrame(t, data, PxcChannelCarData, nil)
+	if got := readPXCResponse(t, data); got.Command != PxcChannelCarData+1 {
+		t.Fatalf("0x%x answered 0x%x", PxcChannelCarData, got.Command)
+	}
+	waitForPhoneChannel(t, control, nil)
+
+	results := sendAsync(control, 0x20110, nil, 0)
+	readPXCResponse(t, data) // never answered
+	if r := awaitResult(t, results); !errors.Is(r.err, ErrPhoneCommandTimeout) {
+		t.Fatalf("err = %v, want ErrPhoneCommandTimeout", r.err)
+	}
+	if err := readPXCError(t, control); err.IsFatal() {
+		t.Fatalf("retiring the last channel ended the session: %v", err)
+	}
+}
+
 // A caller that gives up while its command is still queued must not have it sent later.
 func TestAnExpiredQueuedCommandIsNeverSent(t *testing.T) {
 	control := NewPXCControl(":0", nil, nil)
