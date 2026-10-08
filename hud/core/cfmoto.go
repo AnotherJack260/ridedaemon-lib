@@ -128,6 +128,7 @@ type CfmotoHUD struct {
 	pxcControl   *net.PXCControl
 	mediaControl *net.MediaControl
 	mediaStream  *net.MediaStream
+	mcuLite      *net.MCULite // nil unless the host enabled MCU-Lite (transports.go)
 
 	// Streaming
 	muxSource *stream.MuxSource
@@ -425,7 +426,7 @@ func (hud *CfmotoHUD) startPxcEventFwd(s *net.PXCControl, ready chan<- any) {
 	// consumers would race because a Go channel delivers each event only once.
 	go func() {
 		for evt := range s.Events {
-			if evt.Command == net.PxcHeartbeat || evt.Command == net.PxcHeartbeatOk {
+			if evt.Command == net.PxcHeartbeat || evt.Command == net.PxcHeartbeatOk || evt.Command == net.MCULiteCmdClientInfo {
 				select {
 				case ready <- struct{}{}:
 				default:
@@ -520,21 +521,22 @@ func (hud *CfmotoHUD) SearchForHost(ctx context.Context, timeout time.Duration) 
 }
 
 func (hud *CfmotoHUD) StartStream(ctx context.Context) (err error) {
-	return hud.startStream(ctx, nil)
+	return hud.startStream(ctx, nil, nil)
 }
 
 // StartStreamWithInitConn opens the reverse HUD servers before using a caller-routed EC handshake.
 func (hud *CfmotoHUD) StartStreamWithInitConn(ctx context.Context, initConn stdnet.Conn) (err error) {
-	return hud.startStream(ctx, initConn)
+	return hud.startStream(ctx, initConn, nil)
 }
 
-func (hud *CfmotoHUD) startStream(ctx context.Context, initConn stdnet.Conn) (err error) {
+// afterListen, when set, replaces the EC init: it runs once the reverse servers listen.
+func (hud *CfmotoHUD) startStream(ctx context.Context, initConn stdnet.Conn, afterListen func() error) (err error) {
 	hud.mu.Lock()
 	if hud.running {
 		hud.mu.Unlock()
 		return errors.New("already running")
 	}
-	if hud.host == nil {
+	if hud.host == nil && afterListen == nil {
 		hud.mu.Unlock()
 		return errors.New("host is not set or has not been found")
 	}
@@ -658,6 +660,8 @@ func (hud *CfmotoHUD) startStream(ctx context.Context, initConn stdnet.Conn) (er
 	mediaStream.SetPlainFramingAllowed(hud.plainVideoFraming)
 	hud.wireVideo(mediaControl, mediaStream)
 	pxcServer.HeardElsewhere = mediaStream.LastPoll
+	pxcServer.SetMCULite(hud.mcuLite)
+	mediaStream.SetMCULite(hud.mcuLite)
 	mediaStream.OnVideoPulls = func(phase net.VideoPullPhase, pulls uint64) {
 		payload := make([]byte, 9)
 		payload[0] = byte(phase)
@@ -704,6 +708,9 @@ func (hud *CfmotoHUD) startStream(ctx context.Context, initConn stdnet.Conn) (er
 
 	servers := []StoppableServer{pxcServer, mediaStream, mediaControl}
 	started, err = startReverseServersThenInit(servers, func() error {
+		if afterListen != nil {
+			return afterListen()
+		}
 		logging.Printf("Reverse HUD servers are listening; sending EC stream init command")
 		hud.ecService = net.NewECService(
 			hud.host.Ip, hud.host.Port, hud.host.Package, hud.phoneConfig.PhoneOs,

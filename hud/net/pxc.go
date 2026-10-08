@@ -422,6 +422,9 @@ type PXCControl struct {
 	// OnTransport, when set before Start, receives this package's typed transport events
 	// (emitTransport). The host sees them as EventSourceTransport events with this cmd.
 	OnTransport func(cmd int, payload []byte)
+
+	// mcuLite answers the MCU-Lite family on this port when the host enabled it (SetMCULite).
+	mcuLite *MCULite
 }
 
 // C2PHandler answers one request the dash sends on PXC (an even command), for a command the
@@ -953,6 +956,25 @@ func encodeFrame(res *PXCResponse) []byte {
 	return append(frame, res.Body...)
 }
 
+// pxcFrame is encodeFrame for a frame that is not a PXCResponse yet: {cmd, size, size^cmd, 0}
+// little-endian, size counting the 16-byte header (sdk/i.java:144-163).
+func pxcFrame(cmd uint32, body []byte) []byte {
+	return encodeFrame(&PXCResponse{Command: cmd, Body: body})
+}
+
+// checkPXCHeader is the official app's check on a frame it reads: it closes the socket on a bad
+// magic or a size under the header (sdk/i.java:97-105, MagicError / LengthError). Size 0 stays a
+// header-only frame, as it always was here, and a size no frame could have is refused too.
+func checkPXCHeader(h *PXCResponse) error {
+	if h.Magic != h.Size^h.Command {
+		return fmt.Errorf("bad PXC frame magic 0x%x for command 0x%x size %d", h.Magic, h.Command, h.Size)
+	}
+	if h.Size != 0 && (h.Size < pxcHeaderSize || h.Size-pxcHeaderSize > maxPxcBodySize) {
+		return fmt.Errorf("bad PXC frame size %d for command 0x%x", h.Size, h.Command)
+	}
+	return nil
+}
+
 // Keep the dash's request channel (CAR_CTRL) alive with empty 0x70000000 frames, for firmware
 // that never initiates heartbeats and tears down a channel gone quiet (CFMOTO 800NK / MTX800
 // need both channels kept, see 15df75c). The phone channel gets its beat from the P2C sender,
@@ -1145,6 +1167,9 @@ func (s *PXCControl) handleEvent(event *PXCResponse, conn net.Conn) {
 	default:
 		if h := c2pHandler(event.Command); h != nil && event.Command&1 == 0 {
 			s.answerRegistered(h, event, conn)
+		} else if s.serveOtherFamily(event, conn) {
+			// The other EasyConn families sharing this port: MCU-Lite, MCU, VM (transport_families.go).
+			// Their command ranges (0x105-0x109 << 16) never meet the registry's car-family ones.
 		} else if event.Command == PxcTboxSerial && s.flavor51Defaults() {
 			// CarbitRide answers nothing to 0x102B0, not even an error (v0.f(),
 			// sdk/v0.java:77-80): a stray 0x102B1 can read as the answer to the dash's next
@@ -1328,17 +1353,10 @@ func (s *PXCControl) handleConn(conn net.Conn) {
 		}
 		s.noteHeard(state)
 
-		// Sanity check. The official app closes the socket on a bad magic or a size under the
-		// header (sdk/i.java:97-105, MagicError / LengthError); this used to close silently on
-		// the first and crash the app on the second, a size of 1-15 underflowing make(). Both,
-		// and a size no frame could have, now close and say so. Size 0 stays a header-only
-		// frame, as it always was here.
-		if request.Magic != request.Size^request.Command {
-			fail(PxcDecodeErr, fmt.Errorf("bad PXC frame magic 0x%x for command 0x%x size %d", request.Magic, request.Command, request.Size))
-			return
-		}
-		if request.Size != 0 && (request.Size < pxcHeaderSize || request.Size-pxcHeaderSize > maxPxcBodySize) {
-			fail(PxcDecodeErr, fmt.Errorf("bad PXC frame size %d for command 0x%x", request.Size, request.Command))
+		// Sanity check. This used to close silently on a bad magic and crash the app on a size
+		// of 1-15, which underflowed make(); both now close and say so. See checkPXCHeader.
+		if err := checkPXCHeader(request); err != nil {
+			fail(PxcDecodeErr, err)
 			return
 		}
 
