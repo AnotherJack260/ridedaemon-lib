@@ -330,6 +330,9 @@ type PXCControl struct {
 	p2cTimeout atomic.Int64
 	// lastHeardNanos is the last time the dash said anything on any PXC connection.
 	lastHeardNanos atomic.Int64
+	// HeardElsewhere, when set before Start, reports the last time the dash said anything
+	// outside PXC - a video poll - so a dash still pulling frames is never judged dead.
+	HeardElsewhere func() time.Time
 }
 
 type pxcConnectionState struct {

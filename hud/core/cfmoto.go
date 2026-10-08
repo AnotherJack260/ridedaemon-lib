@@ -518,6 +518,7 @@ func (hud *CfmotoHUD) startStream(ctx context.Context, initConn stdnet.Conn) (er
 	// -- maybe we could change chunkStep to something smaller to reduce latency?
 	mediaStream := net.NewMediaStream(":10920", hud.muxSource, 0x1000, 3*time.Millisecond)
 	mediaStream.SetPlainFramingAllowed(hud.plainVideoFraming)
+	pxcServer.HeardElsewhere = mediaStream.LastPoll
 	mediaStream.OnVideoPulls = func(phase net.VideoPullPhase, pulls uint64) {
 		payload := make([]byte, 9)
 		payload[0] = byte(phase)

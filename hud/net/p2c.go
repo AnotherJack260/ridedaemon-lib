@@ -206,8 +206,9 @@ func (s *PXCControl) noteSocketTimeout(seconds int) {
 // judgeSilentDash ends the session when the dash has stopped answering. CarbitRide ends it as
 // soon as one P2C reply misses the dash's own timeout (sdk/x0.java:200-209, 263-274, then
 // t0.M0() at :328). Here that only happens when the dash has answered on this channel before
-// and has said nothing on ANY PXC connection for that long: a dash that abandons 0x20000 (the
-// Voge case in connectionError) or keeps talking on 0x10000 is alive and is left alone.
+// and has said nothing on ANY PXC connection, nor polled for video, for that long: a dash that
+// abandons 0x20000 (the Voge case in connectionError), keeps talking on 0x10000 or keeps
+// pulling frames is alive and is left alone.
 func (s *PXCControl) judgeSilentDash(state *pxcConnectionState, cmd uint32, timeout time.Duration) {
 	if !state.answered.Load() {
 		return
@@ -215,6 +216,9 @@ func (s *PXCControl) judgeSilentDash(state *pxcConnectionState, cmd uint32, time
 	silent := time.Since(time.Unix(0, s.lastHeardNanos.Load()))
 	if silent < timeout {
 		return
+	}
+	if s.HeardElsewhere != nil && time.Since(s.HeardElsewhere()) < timeout {
+		return // still pulling video: alive, whatever PXC is doing
 	}
 	s.emitError(&PxcError{PxcTimeoutErr, fmt.Errorf(
 		"the dash stopped answering: no reply to 0x%x on the phone channel and nothing on any PXC channel for %s",

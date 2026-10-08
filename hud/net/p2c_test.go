@@ -537,3 +537,15 @@ func TestOnlyTheDashCanReplaceItsPhoneChannel(t *testing.T) {
 		t.Fatal("the dash's own new phone channel did not replace the old one")
 	}
 }
+
+// A dash still polling for video is alive, whatever its PXC channels are doing.
+func TestADashStillPullingVideoIsNotDeclaredDead(t *testing.T) {
+	control, _, dashData := startBeatingSession(t)
+	control.HeardElsewhere = time.Now
+
+	readPXCResponse(t, dashData)
+	writeDashFrame(t, dashData, PxcHeartbeatOk, nil)
+	readPXCResponse(t, dashData) // never answered
+
+	expectNoFatal(t, control, 400*time.Millisecond)
+}

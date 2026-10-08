@@ -142,6 +142,8 @@ type MediaStream struct {
 	// false, i.e. the indexed format every working unit has been streamed so far.
 	plainFramingAllowed atomic.Bool
 	plainFraming        atomic.Bool
+	// lastPollNanos is the last time the dash asked for a frame, on any connection.
+	lastPollNanos atomic.Int64
 
 	// OnVideoPulls, when set before Start, receives every change worth reporting in
 	// how many frames the dash has pulled on a connection: the socket opening, the
@@ -180,6 +182,14 @@ func (s *MediaStream) NegotiatedExtendedProtocol(extended bool) bool {
 		}
 	}
 	return plain
+}
+
+// LastPoll is when the dash last said anything on the video socket; zero if never.
+func (s *MediaStream) LastPoll() time.Time {
+	if n := s.lastPollNanos.Load(); n != 0 {
+		return time.Unix(0, n)
+	}
+	return time.Time{}
 }
 
 // reportPulls hands one pull observation to the host, if it asked for them.
@@ -329,6 +339,7 @@ func (s *MediaStream) handleConn(conn net.Conn) {
 		}
 
 		cmd := binary.LittleEndian.Uint16(header[0:2])
+		s.lastPollNanos.Store(time.Now().UnixNano())
 		// The header's i16 length says how much body follows; the official app reads and
 		// drops it (base/q0.java:1055-1061). Leaving it in the stream would read it as the
 		// next poll and desync every frame after.
