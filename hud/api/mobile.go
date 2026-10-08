@@ -228,6 +228,7 @@ func NewMobileSession(cfg *MobileConfig, cb MobileCallback) (*MobileSession, err
 	// 6 queued AUs ≈ 200ms at 30fps: absorbs producer/poll clock jitter without
 	// dropping frames of a predictive (GOP/intra-refresh) stream, while keeping
 	// worst-case buffered latency low. Overflow drops up to the next IDR (PushFrame).
+	// A dash that polls for H.264 gets 32 AUs / 4 MB instead (SetPollMode), to ride out its pauses.
 	live := stream.NewLiveStreamSource(cfg.TargetFPS, 3*time.Second, 6)
 	// Before anything is pushed: the constructor arms an IDR wait that no JPEG can ever
 	// satisfy, so leaving it armed would drop every still in silence.

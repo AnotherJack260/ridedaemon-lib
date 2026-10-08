@@ -42,6 +42,7 @@ func (hud *CfmotoHUD) wireVideo(mc *net.MediaControl, ms *net.MediaStream) {
 	mc.OnCaptureConfig = func(c net.CaptureConfig) {
 		ms.SetCaptureConfig(c)
 		hud.muxSource.SetLiveOpaque(c.Encoder == 1)
+		hud.muxSource.SetLivePollMode(c.WantFps == 0 && !c.MovieMode) // as MediaStream.handleConn picks the loop
 		hud.video.capture.Store(&c)
 		payload, _ := json.Marshal(c)
 		hud.handleServerEvent(HudEvent{

@@ -22,6 +22,7 @@ type LiveSource interface {
 	PushFrame(au []byte)
 	PrepareForConsumer()
 	SetOpaquePayloads(enabled bool)
+	SetPollMode(enabled bool)
 }
 
 var streamHeader = []byte{
@@ -225,6 +226,25 @@ func NewRawFrameSource(src []byte, targetFPS int) (*RawFrameSource, error) {
 	}, nil
 }
 
+// A dash that polls for each H.264 frame (wantFps=0) gets a queue of up to pollQueueAUs, about a
+// second at 30 fps, and pollQueueBytes, a memory bound that leaves room for a second of 13 Mbps and
+// an IDR. Such a dash pauses its polls for a few hundred ms now and then (decoding a large IDR, the
+// Zontes 350D), then pulls faster than we produce (35/s against 30), so it drains what piled up on
+// its own; the 6-AU queue overflowed on every such pause and froze the picture until an IDR came.
+// Drop-to-IDR stays the answer to a queue that overflows this one.
+//
+// Carbit has no such queue: it feeds its encoder one frame only when none is in flight
+// (mInputCacheCountMax 0, base/l0.java:594-598, q0.java:1138-1141, 585-596), so a dash that stops
+// polling stops the encoder and nothing piles up. Our encoder runs at its own rate, hence this.
+//
+// ponytail: the cap is also the latency bound, ~1 s while the dash is behind. No timer drops a
+// backlog that lingers: one would fire on a dash draining at 5 AU/s after a 1 s pause, and a dash
+// that truly can't keep up fills the cap and overflows anyway. Add one if field lag says so.
+const (
+	pollQueueAUs   = 32
+	pollQueueBytes = 4 << 20
+)
+
 type LiveStreamSource struct {
 	mu sync.Mutex
 
@@ -233,7 +253,10 @@ type LiveStreamSource struct {
 	head     int
 	tail     int
 	count    int
-	capacity int
+	capacity int // ring slots: the deeper of maxQ and pollQueueAUs
+	maxQ     int // the queue's depth outside H.264 poll mode
+	bytes    int // what the queued AUs add up to
+	polled   bool
 
 	lastAU      []byte // Freeze frame
 	lastAdvance time.Time
@@ -270,8 +293,9 @@ func NewLiveStreamSource(targetFPS int, liveTimeout time.Duration, maxQ int) *Li
 		maxQ = 15
 	}
 	return &LiveStreamSource{
-		aus:         make([][]byte, maxQ),
-		capacity:    maxQ,
+		aus:         make([][]byte, max(maxQ, pollQueueAUs)),
+		capacity:    max(maxQ, pollQueueAUs),
+		maxQ:        maxQ,
 		lastAU:      nil,
 		lastAdvance: time.Time{},
 		interval:    time.Second / time.Duration(targetFPS),
@@ -294,6 +318,27 @@ func (s *LiveStreamSource) SetOpaquePayloads(enabled bool) {
 		s.opaque = enabled
 		s.clearLocked()
 	}
+}
+
+// SetPollMode deepens the H.264 queue to pollQueueAUs for a dash that polls for each frame, or
+// returns it to the constructor's depth. JPEG stills keep that depth either way. A queue deeper
+// than the new depth drops to an IDR on the next push.
+func (s *LiveStreamSource) SetPollMode(enabled bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.polled = enabled
+}
+
+// fullLocked reports whether queueing n more bytes needs room made first. An empty queue always
+// takes the AU, however big.
+func (s *LiveStreamSource) fullLocked(n int) bool {
+	if s.count == 0 {
+		return false
+	}
+	if s.polled && !s.opaque {
+		return s.count >= s.capacity || s.bytes+n > pollQueueBytes
+	}
+	return s.count >= s.maxQ
 }
 
 // PushFrame is called by a live encoder, expected H.264 AU in Annex B aud + sps/pps + idr,
@@ -330,20 +375,24 @@ func (s *LiveStreamSource) pushLocked(au []byte) int {
 		s.keyframeOwed, s.owedDropped = false, 0
 	}
 
-	if s.count == s.capacity {
+	dropped := 0
+	for s.fullLocked(len(au)) {
 		if s.opaque {
 			// Every still is a whole picture: dropping the oldest loses nothing else.
 			s.dropHeadLocked()
-		} else if dropped := s.dropToIDRLocked(); s.count == 0 && !hasAnnexBNALType(au, 5) {
-			// Nothing left decodes without what was just dropped, and neither does this AU.
-			// The official app never gets here - one frame in flight per poll
-			// (base/q0.java:585-596, 713-721) - so the queue waits for an IDR and asks for one.
-			s.awaitIDR = true
-			s.keyframeOwed = true
-			s.owedDropped += dropped + 1
-			logging.Printf("LiveStreamSource: queue overflowed with no IDR in it; dropped %d AUs, waiting for an IDR", dropped+1)
-			return s.askForKeyframeLocked(now)
+		} else {
+			dropped += s.dropToIDRLocked()
 		}
+	}
+	if dropped > 0 && s.count == 0 && !hasAnnexBNALType(au, 5) {
+		// Nothing left decodes without what was just dropped, and neither does this AU.
+		// The official app never gets here - one frame in flight per poll
+		// (base/q0.java:585-596, 713-721) - so the queue waits for an IDR and asks for one.
+		s.awaitIDR = true
+		s.keyframeOwed = true
+		s.owedDropped += dropped + 1
+		logging.Printf("LiveStreamSource: queue overflowed with no IDR in it; dropped %d AUs, waiting for an IDR", dropped+1)
+		return s.askForKeyframeLocked(now)
 	}
 
 	buf := append([]byte(nil), au...) // copy buffer so memory can be reused
@@ -351,6 +400,7 @@ func (s *LiveStreamSource) pushLocked(au []byte) int {
 	s.aus[s.tail] = buf
 	s.tail = (s.tail + 1) % s.capacity
 	s.count++
+	s.bytes += len(buf)
 	return 0
 }
 
@@ -382,6 +432,7 @@ func (s *LiveStreamSource) dropToIDRLocked() int {
 }
 
 func (s *LiveStreamSource) dropHeadLocked() {
+	s.bytes -= len(s.aus[s.head])
 	s.aus[s.head] = nil
 	s.head = (s.head + 1) % s.capacity
 	s.count--
@@ -399,6 +450,7 @@ func (s *LiveStreamSource) clearLocked() {
 		s.aus[i] = nil
 	}
 	s.count = 0
+	s.bytes = 0
 	s.head = 0
 	s.tail = 0
 	s.lastAU = nil
@@ -426,6 +478,7 @@ func (s *LiveStreamSource) resetLocked() {
 	s.lastAU = nil
 	s.lastAdvance = time.Time{}
 	s.count = 0
+	s.bytes = 0
 	s.head = 0
 	s.tail = 0
 	s.awaitIDR = !s.opaque
@@ -478,9 +531,7 @@ func (s *LiveStreamSource) NextFrame(now time.Time) ([]byte, error) {
 	// Pop the next live AU
 	if s.count > 0 {
 		au := s.aus[s.head]
-		s.aus[s.head] = nil // give the garbage collector a hand ;)
-		s.head = (s.head + 1) % s.capacity
-		s.count--
+		s.dropHeadLocked()
 
 		s.lastAU = au
 		s.lastAdvance = now
@@ -638,5 +689,13 @@ func (m *MuxSource) PrepareLiveConsumer() {
 func (m *MuxSource) SetLiveOpaque(enabled bool) {
 	if m.Live != nil {
 		m.Live.SetOpaquePayloads(enabled)
+	}
+}
+
+// SetLivePollMode deepens the live H.264 queue for a dash that polls for each frame (wantFps=0,
+// no movie mode), or returns it to its own depth for one that is pushed or grants frames.
+func (m *MuxSource) SetLivePollMode(enabled bool) {
+	if m.Live != nil {
+		m.Live.SetPollMode(enabled)
 	}
 }

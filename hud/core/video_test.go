@@ -40,3 +40,34 @@ func TestCaptureConfigReachesTheQueueTheHostAndTheGetter(t *testing.T) {
 		t.Fatalf("a JPEG negotiation left the queue dropping stills: %x", frame)
 	}
 }
+
+// Only a dash that polls for H.264 gets the deep queue: 20 frames it has not pulled yet are all
+// still there. A pushed or movie-mode dash keeps the 6-AU queue, which has overflowed by then.
+func TestOnlyAPollingDashGetsTheDeepQueue(t *testing.T) {
+	for _, tc := range []struct {
+		config net.CaptureConfig
+		want   int
+	}{
+		{net.CaptureConfig{WantFps: 0, Encoder: 2}, 20},
+		{net.CaptureConfig{WantFps: 30, Encoder: 2}, 0},
+		{net.CaptureConfig{WantFps: 0, Encoder: 2, MovieMode: true}, 0},
+	} {
+		live := stream.NewLiveStreamSource(30, 3*time.Second, 6)
+		hud := NewCfmotoHUD(30, &stream.MuxSource{Live: live}, 0)
+		control := net.NewMediaControl(":0")
+		hud.wireVideo(control, net.NewMediaStream(":0", nil, 0, 0))
+		control.OnCaptureConfig(tc.config)
+
+		live.PushFrame([]byte{0, 0, 0, 1, 0x65, 0})
+		for i := 1; i < 20; i++ {
+			live.PushFrame([]byte{0, 0, 0, 1, 0x41, byte(i)})
+		}
+		got := 0
+		for frame, _ := live.NextFrame(time.Now()); frame != nil && int(frame[5]) == got; frame, _ = live.NextFrame(time.Now()) {
+			got++
+		}
+		if got != tc.want {
+			t.Errorf("%+v: the dash got %d frames, want %d", tc.config, got, tc.want)
+		}
+	}
+}
