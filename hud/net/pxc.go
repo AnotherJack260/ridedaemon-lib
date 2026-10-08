@@ -719,12 +719,7 @@ func (s *PXCControl) writeResponse(res *PXCResponse, conn net.Conn, raw *[]byte)
 
 		// Header and body in one write, as the official app flushes them (sdk/i.java:149-163):
 		// four header writes on a TCP_NODELAY socket went out as four segments.
-		frame := make([]byte, pxcHeaderSize, int(res.Size))
-		binary.LittleEndian.PutUint32(frame[0:], res.Command)
-		binary.LittleEndian.PutUint32(frame[4:], res.Size)
-		binary.LittleEndian.PutUint32(frame[8:], res.Magic)
-		binary.LittleEndian.PutUint32(frame[12:], res.Token)
-		if _, err := conn.Write(append(frame, res.Body...)); err != nil {
+		if _, err := conn.Write(pxcFrame(res.Command, res.Body)); err != nil {
 			return err
 		}
 	} else if raw != nil {
@@ -733,6 +728,30 @@ func (s *PXCControl) writeResponse(res *PXCResponse, conn net.Conn, raw *[]byte)
 		}
 	}
 
+	return nil
+}
+
+// pxcFrame is one PXC frame, header and body: {cmd, size, size^cmd, 0} little-endian, size
+// counting the 16-byte header (sdk/i.java:144-163).
+func pxcFrame(cmd uint32, body []byte) []byte {
+	size := uint32(pxcHeaderSize + len(body))
+	frame := make([]byte, pxcHeaderSize, size)
+	binary.LittleEndian.PutUint32(frame[0:], cmd)
+	binary.LittleEndian.PutUint32(frame[4:], size)
+	binary.LittleEndian.PutUint32(frame[8:], size^cmd)
+	return append(frame, body...)
+}
+
+// checkPXCHeader is the official app's check on a frame it reads: it closes the socket on a bad
+// magic or a size under the header (sdk/i.java:97-105, MagicError / LengthError). Size 0 stays a
+// header-only frame, as it always was here, and a size no frame could have is refused too.
+func checkPXCHeader(h *PXCResponse) error {
+	if h.Magic != h.Size^h.Command {
+		return fmt.Errorf("bad PXC frame magic 0x%x for command 0x%x size %d", h.Magic, h.Command, h.Size)
+	}
+	if h.Size != 0 && (h.Size < pxcHeaderSize || h.Size-pxcHeaderSize > maxPxcBodySize) {
+		return fmt.Errorf("bad PXC frame size %d for command 0x%x", h.Size, h.Command)
+	}
 	return nil
 }
 
@@ -1078,17 +1097,10 @@ func (s *PXCControl) handleConn(conn net.Conn) {
 		}
 		s.noteHeard(state)
 
-		// Sanity check. The official app closes the socket on a bad magic or a size under the
-		// header (sdk/i.java:97-105, MagicError / LengthError); this used to close silently on
-		// the first and crash the app on the second, a size of 1-15 underflowing make(). Both,
-		// and a size no frame could have, now close and say so. Size 0 stays a header-only
-		// frame, as it always was here.
-		if request.Magic != request.Size^request.Command {
-			fail(PxcDecodeErr, fmt.Errorf("bad PXC frame magic 0x%x for command 0x%x size %d", request.Magic, request.Command, request.Size))
-			return
-		}
-		if request.Size != 0 && (request.Size < pxcHeaderSize || request.Size-pxcHeaderSize > maxPxcBodySize) {
-			fail(PxcDecodeErr, fmt.Errorf("bad PXC frame size %d for command 0x%x", request.Size, request.Command))
+		// Sanity check. This used to close silently on a bad magic and crash the app on a size
+		// of 1-15, which underflowed make(); both now close and say so. See checkPXCHeader.
+		if err := checkPXCHeader(request); err != nil {
+			fail(PxcDecodeErr, err)
 			return
 		}
 
