@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -66,6 +67,9 @@ const TransportCmdAppStatusNotify = 4
 // Payload: 4 bytes big-endian, how many access units were dropped. At most once a second.
 const TransportCmdKeyframeNeeded = 5
 
+// Transport events that report a dash request carry that request's PXC command number, so a
+// feature added in hud/net (RegisterC2PHandler + emitTransport) never needs a number from here.
+
 type HudEvent struct {
 	Source HudEventSource
 	Time   time.Time
@@ -97,16 +101,25 @@ type CfmotoHUD struct {
 	phoneConfig           *net.PhoneConfig
 	supportFunction       int
 	proactivePxcHeartbeat bool
+	idleProbe             bool
 	plainVideoFraming     bool
 	pageSwitchProbe       bool
 	jpegStills            bool
 	appStatusNotify       bool
+	noFlavor51Lifecycle   bool
+	appForeground         bool
 	phoneScreen           net.PhoneScreen
 	timeZoneID            string
 	timeZoneOffsetSec     int
 	timeZoneOffsetSet     bool
 	skipDashClockSync     bool
 	dashAsksForTime       bool
+
+	// What the host said about the phone; see SetPhoneIdentity.
+	identityKey         *net.KeyPair
+	echoSupportFunction bool
+	speechEngineType    int
+	tlsCert             *tls.Certificate
 
 	// net management
 	keyPair      *net.KeyPair
@@ -131,6 +144,7 @@ func NewCfmotoHUD(targetFPS int, mux *stream.MuxSource, supportFunction int) *Cf
 	}
 	id := uuid.New()
 	pkg := "com.cfmoto.cfmotointernational"
+	sf := int64(supportFunction)
 	return &CfmotoHUD{
 		packageName:     pkg,
 		phoneUUID:       id,
@@ -149,7 +163,7 @@ func NewCfmotoHUD(targetFPS int, mux *stream.MuxSource, supportFunction int) *Cf
 			EncryptedHUID:         "", // Done inside PXC
 			BluetoothName:         "Pixel 6a",
 			SupportH264IFrame:     true,
-			SupportFunction:       supportFunction,
+			SupportFunction:       &sf,
 			AppVersionFingerPrint: "V:2.2.1(121)--ONLINE",
 		},
 		targetFPS: targetFPS,
@@ -160,12 +174,93 @@ func NewCfmotoHUD(targetFPS int, mux *stream.MuxSource, supportFunction int) *Cf
 	}
 }
 
+// PhoneIdentity is who the phone says it is in the CLIENT_INFO reply. The host keeps these from
+// one session to the next - the official app does (phoneUUID and its RSA key, dk/a.java:114-130,
+// nec/utils/RSAUtil.java:114-138), so a dash that remembers phones sees the same one each time -
+// and this library never stores anything. A zero field keeps what every earlier build sent.
+type PhoneIdentity struct {
+	// Package goes out as "package": the official app sends its own (CI:1019).
+	Package string
+	// PhoneUUID goes out as "phoneUUID"; the default is new for every MobileSession.
+	PhoneUUID string
+	// RSAKey signs encryptedHUID and gives "pubkey" (net.ParseKeyPair); the default is a fresh
+	// 1024-bit key per session.
+	RSAKey []byte
+	// Brand, Model, SdkVersion and BluetoothName are Build.BRAND, Build.MODEL,
+	// Build.VERSION.SDK_INT and the Bluetooth adapter's name (CI:1015-1018, 1025).
+	Brand         string
+	Model         string
+	SdkVersion    int
+	BluetoothName string
+	// EchoSupportFunction answers with the dash's own capability bits; see
+	// net.PXCControl.SetEchoSupportFunction.
+	EchoSupportFunction bool
+	// SpeechEngineType: see net.PXCControl.SetSpeechEngineType.
+	SpeechEngineType int
+}
+
+// SetPhoneIdentity applies id to the CLIENT_INFO reply. Call it before StartStream.
+func (hud *CfmotoHUD) SetPhoneIdentity(id PhoneIdentity) error {
+	var key *net.KeyPair
+	if len(id.RSAKey) > 0 {
+		var err error
+		if key, err = net.ParseKeyPair(id.RSAKey); err != nil {
+			return err
+		}
+	}
+	hud.mu.Lock()
+	defer hud.mu.Unlock()
+	if hud.running {
+		return errors.New("already running")
+	}
+	pc := hud.phoneConfig
+	set := func(field *string, value string) {
+		if value != "" {
+			*field = value
+		}
+	}
+	set(&pc.Package, id.Package)
+	set(&pc.PhoneUUID, id.PhoneUUID)
+	set(&pc.PhoneBrand, id.Brand)
+	set(&pc.PhoneModel, id.Model)
+	set(&pc.BluetoothName, id.BluetoothName)
+	if id.SdkVersion > 0 {
+		pc.PhoneOsVersion = strconv.Itoa(id.SdkVersion)
+	}
+	if key != nil {
+		hud.identityKey = key
+	}
+	hud.echoSupportFunction = id.EchoSupportFunction
+	hud.speechEngineType = id.SpeechEngineType
+	return nil
+}
+
+// SetTLSCertificate is what the phone serves when a dash asks for TLS on PXC (0x107C0). Without
+// one the dash is answered as before and the session stays plaintext. Call it before StartStream.
+func (hud *CfmotoHUD) SetTLSCertificate(cert tls.Certificate) error {
+	hud.mu.Lock()
+	defer hud.mu.Unlock()
+	if hud.running {
+		return errors.New("already running")
+	}
+	hud.tlsCert = &cert
+	return nil
+}
+
 // SetProactivePxcHeartbeat enables the dual CAR_CTRL/CAR_DATA keepalive used by
 // firmware that tears down idle PXC channels. Configure it before StartStream.
 func (hud *CfmotoHUD) SetProactivePxcHeartbeat(enabled bool) {
 	hud.mu.Lock()
 	defer hud.mu.Unlock()
 	hud.proactivePxcHeartbeat = enabled
+}
+
+// SetIdleProbe enables CarbitRide's cmd-0 probe on the phone channel. See
+// net.PXCControl.SetIdleProbe. Configure it before StartStream.
+func (hud *CfmotoHUD) SetIdleProbe(enabled bool) {
+	hud.mu.Lock()
+	defer hud.mu.Unlock()
+	hud.idleProbe = enabled
 }
 
 // SetPlainVideoFramingAllowed lets a dash that reports supportExtendProtocol=0 pull
@@ -201,12 +296,32 @@ func (hud *CfmotoHUD) SetJpegStills(enabled bool) {
 
 // SetAppStatusNotify makes the phone announce its mirroring state to the head unit the
 // way the official app does - once when PXC comes up, and again when the dash starts
-// pulling frames. Off by default; configure it before StartStream. See
-// hud/net/appstatus.go.
+// pulling frames - for any dash. A flavor-51 dash gets it without this (SetFlavor51Lifecycle);
+// every other dash only with it. Configure it before StartStream. See hud/net/appstatus.go.
 func (hud *CfmotoHUD) SetAppStatusNotify(enabled bool) {
 	hud.mu.Lock()
 	defer hud.mu.Unlock()
 	hud.appStatusNotify = enabled
+}
+
+// SetFlavor51Lifecycle controls the official app's lifecycle commands a flavor-51 dash gets by
+// default. See net.PXCControl.SetFlavor51Lifecycle. Configure it before StartStream.
+func (hud *CfmotoHUD) SetFlavor51Lifecycle(enabled bool) {
+	hud.mu.Lock()
+	defer hud.mu.Unlock()
+	hud.noFlavor51Lifecycle = !enabled
+}
+
+// SetAppForeground says whether the host's own UI is in the phone's foreground, which turns the
+// APPSTATUS notification into 0x20020. Takes effect at once on a running session.
+func (hud *CfmotoHUD) SetAppForeground(foreground bool) {
+	hud.mu.Lock()
+	hud.appForeground = foreground
+	pxc := hud.pxcControl
+	hud.mu.Unlock()
+	if pxc != nil {
+		pxc.SetAppForeground(foreground)
+	}
 }
 
 // SetPhoneScreen supplies the display metrics that notification carries. Only the host
@@ -428,9 +543,14 @@ func (hud *CfmotoHUD) startStream(ctx context.Context, initConn stdnet.Conn) (er
 	}
 	hud.mu.Unlock()
 
-	if hud.keyPair, err = net.GenKeyPair(); err != nil {
-		return err
+	if hud.keyPair = hud.identityKey; hud.keyPair == nil {
+		if hud.keyPair, err = net.GenKeyPair(); err != nil {
+			return err
+		}
 	}
+	// A previous session's echo may have rewritten these.
+	sf := int64(hud.supportFunction)
+	hud.phoneConfig.SupportFunction, hud.phoneConfig.SupportFunctionEx = &sf, nil
 
 	var started []StoppableServer
 
@@ -458,6 +578,12 @@ func (hud *CfmotoHUD) startStream(ctx context.Context, initConn stdnet.Conn) (er
 	pxcReady := make(chan any, 1)
 	pxcServer := net.NewPXCControl(":10922", hud.keyPair, hud.phoneConfig)
 	pxcServer.SetProactiveHeartbeat(hud.proactivePxcHeartbeat)
+	pxcServer.SetIdleProbe(hud.idleProbe)
+	if hud.tlsCert != nil {
+		pxcServer.SetTLSCertificate(*hud.tlsCert)
+	}
+	pxcServer.SetEchoSupportFunction(hud.echoSupportFunction)
+	pxcServer.SetSpeechEngineType(hud.speechEngineType)
 	pxcServer.SetPageSwitchProbe(hud.pageSwitchProbe)
 	pxcServer.OnPageSwitchProbe = func(step net.PageSwitchProbeStep, command uint32, err error) {
 		payload := make([]byte, 6)
@@ -474,6 +600,11 @@ func (hud *CfmotoHUD) startStream(ctx context.Context, initConn stdnet.Conn) (er
 		})
 	}
 	pxcServer.SetAppStatusNotify(hud.appStatusNotify)
+	pxcServer.SetFlavor51Lifecycle(!hud.noFlavor51Lifecycle)
+	hud.mu.Lock()
+	foreground := hud.appForeground // the one setter the host may call while this runs
+	hud.mu.Unlock()
+	pxcServer.SetAppForeground(foreground)
 	pxcServer.SetPhoneScreen(hud.phoneScreen)
 	pxcServer.OnAppStatus = func(mode int, err error) {
 		payload := make([]byte, 2)
@@ -487,6 +618,9 @@ func (hud *CfmotoHUD) startStream(ctx context.Context, initConn stdnet.Conn) (er
 			Cmd:    TransportCmdAppStatusNotify,
 			Data:   payload,
 		})
+	}
+	pxcServer.OnTransport = func(cmd int, payload []byte) {
+		hud.handleServerEvent(HudEvent{Source: EventSourceTransport, Time: time.Now(), Cmd: cmd, Data: payload})
 	}
 	pxcServer.SetTimeZoneID(hud.timeZoneID)
 	if hud.timeZoneOffsetSet {
@@ -514,6 +648,9 @@ func (hud *CfmotoHUD) startStream(ctx context.Context, initConn stdnet.Conn) (er
 		// once REQ_RV_DATA_START has been answered 113. This is that instant on our
 		// side: the dash has asked for the stream and the live consumer is armed.
 		pxcServer.SendAppStatus(net.AppStatusMirrorLive)
+		// switchEc2Front goes out when the phone's stream starts and no frame has reached the
+		// dash yet (sdk/b0.java:696-707), which is now.
+		pxcServer.SwitchEcToFront()
 	}
 	// -- maybe we could change chunkStep to something smaller to reduce latency?
 	mediaStream := net.NewMediaStream(":10920", hud.muxSource, 0x1000, 3*time.Millisecond)
@@ -683,6 +820,18 @@ func (hud *CfmotoHUD) SendPhoneCommand(cmd uint32, body []byte, timeout time.Dur
 		return nil, errors.New("the session is not running")
 	}
 	return pxc.SendPhoneCommand(cmd, body, timeout)
+}
+
+// ReleaseDash hands the dash back its own UI before the session stops. See
+// net.PXCControl.ReleaseDash.
+func (hud *CfmotoHUD) ReleaseDash() error {
+	hud.mu.Lock()
+	pxc := hud.pxcControl
+	hud.mu.Unlock()
+	if pxc == nil {
+		return errors.New("the session is not running")
+	}
+	return pxc.ReleaseDash()
 }
 
 func (hud *CfmotoHUD) IsRunning() bool {

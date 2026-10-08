@@ -56,10 +56,11 @@ func (s *ECService) decodePayload(payload []byte) (*ECResponse, error) {
 	header := payload[:16]
 	body := payload[16:]
 
-	// Sanity check there's a newline defining the end of the payload
+	// The body ends at its first newline when it has one. The official app reads the reply by its
+	// length alone (sdk/s.java:852-866), so a dash that sends none is not refused for it.
 	newlineIdx := bytes.IndexByte(body, '\n')
 	if newlineIdx == -1 {
-		return nil, fmt.Errorf("no newline terminator found (0x0a)")
+		newlineIdx = len(body)
 	}
 
 	// Process header

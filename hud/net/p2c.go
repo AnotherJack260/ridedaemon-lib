@@ -164,18 +164,19 @@ func (s *PXCControl) startP2C() {
 // has been queued for a heartbeat interval, send a heartbeat and wait for its answer the same
 // way (sdk/x0.java:184-224). The heartbeat stays opt-in (SetProactiveHeartbeat), as it was.
 //
-// ponytail: x0 sends cmd 0 instead of the heartbeat on the first idle tick after a command and
-// every 7th after that, expecting 0x80000010 and ignoring a miss (sdk/x0.java:185-217); left
-// out, since no dash has been seen to need it.
+// With SetIdleProbe, the first idle tick after a command and every 7th after it carries cmd 0
+// instead, as x0 sends it (sdk/x0.java:39-56, 185-217).
 func (s *PXCControl) runP2C() {
 	defer s.wg.Done()
 	idle := time.NewTimer(s.heartbeatEvery())
 	defer idle.Stop()
+	idleTicks := 0
 	for {
 		select {
 		case <-s.quit:
 			return
 		case req := <-s.p2cQueue:
+			idleTicks = 0
 			if !req.deadline.IsZero() && time.Now().After(req.deadline) {
 				req.done <- p2cResult{err: errPhoneCommandExpired}
 				continue
@@ -185,7 +186,17 @@ func (s *PXCControl) runP2C() {
 		case <-idle.C:
 			// Only while there is a phone channel: once the dash has closed it, there is
 			// nothing to keep alive and nothing to log every 2 s.
-			if s.proactiveHeartbeat && s.phoneChannel() != nil {
+			if s.phoneChannel() == nil {
+				break
+			}
+			probe := s.idleProbe && idleTicks%7 == 0
+			idleTicks++
+			if probe {
+				// x0 expects 0x80000010 and only logs anything else; a miss is not an error there.
+				if reply, err := s.p2cExchange(0, nil, nil); err == nil && reply.Command != PxcStatusUnsupported {
+					logging.Printf("PXC idle probe: cmd 0 answered 0x%x", reply.Command)
+				}
+			} else if s.proactiveHeartbeat {
 				if _, err := s.p2cExchange(PxcHeartbeat, nil, nil); err != nil && !s.isStopping() {
 					logging.Printf("PXC CAR_DATA heartbeat: %v", err)
 				}
@@ -193,6 +204,13 @@ func (s *PXCControl) runP2C() {
 		}
 		idle.Reset(s.heartbeatEvery())
 	}
+}
+
+// SetIdleProbe sends CarbitRide's cmd-0 probe on the phone channel's first idle tick after a
+// command and every 7th after it, in place of the heartbeat (sdk/x0.java:185-217). Off by default:
+// no dash has been seen to need it. Configure it before Start.
+func (s *PXCControl) SetIdleProbe(enabled bool) {
+	s.idleProbe = enabled
 }
 
 // noteSocketTimeout takes CLIENT_INFO's socketTimeoutPeriodWifi as the reply timeout, as

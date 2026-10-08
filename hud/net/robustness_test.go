@@ -1,6 +1,7 @@
 package net
 
 import (
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"io"
@@ -270,4 +271,118 @@ func TestEveryZontesCommandIsAnsweredLikeTheOfficialApp(t *testing.T) {
 			}
 		})
 	}
+}
+
+// CAR_SUPPORT_CMDS is acked empty, or answered 0x80000020 when the body is not a JSON object,
+// as km/h.java:22-36 does.
+func TestCarSupportCmdsIsAnsweredLikeTheOfficialApp(t *testing.T) {
+	for _, tc := range []struct {
+		name, body string
+		want       uint32
+	}{
+		{"a JSON object", `{"cmds":[131344,131600]}`, PxcCarSupportCmds + 1},
+		{"no body", ``, PxcCarSupportCmds + 1},
+		{"not JSON", `131344,131600`, PxcStatusError},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			control := NewPXCControl(":0", nil, nil)
+			got := handlePXCEventAndReadResponses(t, control, &PXCResponse{Command: PxcCarSupportCmds, Body: json.RawMessage(tc.body)}, 1)[0]
+			if got.Command != tc.want || (tc.want != PxcStatusError && len(got.Body) != 0) {
+				t.Fatalf("reply = 0x%x %q, want 0x%x", got.Command, got.Body, tc.want)
+			}
+		})
+	}
+}
+
+// The official app answers nothing to 0x102B0 (sdk/v0.java:77-80). A flavor-51 dash gets that
+// silence; every other dash keeps the cmd+1 CFDL26-style firmware waits for.
+func TestTboxSerialIsAnsweredOnlyOffFlavor51(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		flavor string
+		optOut bool
+		reply  bool
+	}{
+		{"Zontes, flavor 51", `51`, false, false},
+		{"flavor 51, host opted out", `51`, true, true},
+		{"CFMOTO-style dash", `3`, false, true},
+		{"no CLIENT_INFO yet", ``, false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			control := NewPXCControl(":0", nil, nil)
+			control.SetFlavor51Lifecycle(!tc.optOut)
+			if tc.flavor != "" {
+				control.HudConfig = &HUDConfig{Flavor: json.RawMessage(tc.flavor)}
+			}
+			client, server := stdnet.Pipe()
+			defer client.Close()
+			defer server.Close()
+			go control.handleEvent(&PXCResponse{Command: PxcTboxSerial, Body: []byte(`{"tbox":{"sn":"S1"}}`)}, client)
+			if !tc.reply {
+				assertSilent(t, server, "a flavor-51 dash after 0x102B0")
+				return
+			}
+			_ = server.SetReadDeadline(time.Now().Add(time.Second))
+			if got := readPXCResponse(t, server); got.Command != PxcTboxSerial+1 || len(got.Body) != 0 {
+				t.Fatalf("reply = 0x%x %q", got.Command, got.Body)
+			}
+		})
+	}
+}
+
+// The owner's Zontes 350D (JCDZ21-E42b, flavor 51, channel 21321) end to end over TCP: what the
+// phone volunteers goes on the phone channel only, one command at a time, in the official app's
+// order - APPSTATUS 2 when the channel opens, CHECK_SN_RESULT, then at STREAM_START APPSTATUS 1
+// and switchEc2Front, and when the rider stops switchEc2Background and STOP_SERVICE.
+func TestZontesSessionGetsTheOfficialLifecycle(t *testing.T) {
+	keys, err := GenKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	control := NewPXCControl("127.0.0.1:0", keys, &PhoneConfig{PxcVersion: "1.0.2"})
+	if err := control.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = control.Stop(ctx)
+	})
+
+	ctrl := dialDash(t, control, PxcHandshake)
+	writeDashFrame(t, ctrl, PxcHudConf, []byte(`{"HUID":"h","HUName":"JCDZ21-E42b","flavor":51,"channel":"21321","pxcVersion":"1.0.1"}`))
+	if got := readPXCResponse(t, ctrl); got.Command != PxcPhoneConf {
+		t.Fatalf("CLIENT_INFO answered 0x%x", got.Command)
+	}
+	data := dialDash(t, control, PxcChannelCarData)
+	expect := func(cmd uint32, body string) {
+		t.Helper()
+		got := readPXCResponse(t, data)
+		if got.Command != cmd || (body != "" && !strings.Contains(string(got.Body), body)) {
+			t.Fatalf("phone channel: 0x%x %s, want 0x%x %s", got.Command, got.Body, cmd, body)
+		}
+		writeDashFrame(t, data, cmd+1, nil)
+	}
+	expect(PxcAppStatus, `"mode":2`)
+
+	writeDashFrame(t, ctrl, PxcClientSet, []byte(`{"client_set":"easy_conn","sn":"S"}`))
+	if got := readPXCResponse(t, ctrl); got.Command != PxcCheckSnAck {
+		t.Fatalf("CHECK_SN answered 0x%x", got.Command)
+	}
+	expect(PxcCheckSnResult, `"isOk":true`)
+
+	// What core does on STREAM_START.
+	control.SendAppStatus(AppStatusMirrorLive)
+	control.SwitchEcToFront()
+	expect(PxcAppStatus, `"mode":1`)
+	expect(PxcSwitchEcToFront, "")
+
+	released := make(chan error, 1)
+	go func() { released <- control.ReleaseDash() }()
+	expect(PxcSwitchEcToBackground, "")
+	expect(PxcStopService, "")
+	if err := <-released; err != nil {
+		t.Fatalf("ReleaseDash() = %v", err)
+	}
+	assertSilent(t, ctrl, "the Zontes request channel")
 }

@@ -549,3 +549,52 @@ func TestADashStillPullingVideoIsNotDeclaredDead(t *testing.T) {
 
 	expectNoFatal(t, control, 400*time.Millisecond)
 }
+
+// With the probe on, the first idle tick after a command and every 7th after it carry cmd 0, which
+// a CarbitRide-built dash answers 0x80000010 (sdk/x0.java:185-217); the rest are heartbeats.
+func TestIdleProbeEverySeventhTick(t *testing.T) {
+	control := NewPXCControl(":0", nil, nil)
+	control.SetProactiveHeartbeat(true)
+	control.SetIdleProbe(true)
+	control.heartbeatInterval = 5 * time.Millisecond
+	client, phone := openPhoneChannel(t, control)
+
+	expect := func(want uint32) {
+		t.Helper()
+		got := readPXCResponse(t, phone)
+		if got.Command != want {
+			t.Fatalf("idle frame = 0x%x, want 0x%x", got.Command, want)
+		}
+		answer := PxcStatusUnsupported
+		if want != 0 {
+			answer = want + 1
+		}
+		control.handleEvent(&PXCResponse{Command: answer}, client)
+	}
+	expect(0)
+	for i := 0; i < 6; i++ {
+		expect(PxcHeartbeat)
+	}
+	expect(0)
+	expect(PxcHeartbeat)
+
+	// A command resets the count: the next idle tick probes again.
+	results := sendAsync(control, 0x20110, nil, 0)
+	expect(0x20110)
+	awaitResult(t, results)
+	expect(0)
+}
+
+// Off by default: only heartbeats.
+func TestIdleProbeIsOptIn(t *testing.T) {
+	control := NewPXCControl(":0", nil, nil)
+	control.SetProactiveHeartbeat(true)
+	control.heartbeatInterval = 5 * time.Millisecond
+	client, phone := openPhoneChannel(t, control)
+	for i := 0; i < 8; i++ {
+		if got := readPXCResponse(t, phone); got.Command != PxcHeartbeat {
+			t.Fatalf("idle frame %d = 0x%x, want the heartbeat", i, got.Command)
+		}
+		control.handleEvent(&PXCResponse{Command: PxcHeartbeatOk}, client)
+	}
+}

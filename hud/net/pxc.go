@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -50,6 +51,10 @@ const (
 	PxcOtaFtpInfo       uint32 = 0x103a0
 	PxcMediaFeatureConf uint32 = 0x10020
 	PxcCheckSnResult    uint32 = 0x201c0
+	// PxcTboxSerial is the dash stating its T-Box serial, {"tbox":{"sn":...}} (km/d.java).
+	PxcTboxSerial uint32 = 0x102b0
+	// PxcCarSupportCmds is ECP_C2P_CAR_SUPPORT_CMDS, a JSON object (km/h.java).
+	PxcCarSupportCmds uint32 = 0x10470
 	// The dash asks the phone what time it is. The default branch below would
 	// already answer this with an empty cmd+1, which is what shipped until now;
 	// naming it lets the reply carry the timestamp the request is asking for.
@@ -85,6 +90,19 @@ var pxcCannedReplies = map[uint32]json.RawMessage{
 	0x10750: json.RawMessage(`{"status":0}`),
 	// A text the dash wants shown on the phone; answered {} (km/l0.java:22-31).
 	0x104E0: json.RawMessage(`{}`),
+}
+
+func init() {
+	// CarbitRide parses the list and does nothing else with it - ec/b.java has no G() override -
+	// so the empty ack is its whole answer; a body that is not a JSON object is a handler error
+	// (km/h.java:22-36). The request itself reaches the host's event stream as usual.
+	RegisterC2PHandler(PxcCarSupportCmds, func(_ *PXCControl, req *PXCResponse) ([]byte, error) {
+		if len(req.Body) == 0 {
+			return nil, nil
+		}
+		var cmds map[string]json.RawMessage
+		return nil, json.Unmarshal(req.Body, &cmds)
+	})
 }
 
 type checkSnRequest struct {
@@ -131,22 +149,25 @@ type HUDConfig struct {
 	// identifies its development profile with a string ("simulator"). The
 	// transport forwards the original HUD_CONFIG to Android and does not need a
 	// normalized value here, so retain the JSON form and accept both variants.
-	Flavor                    json.RawMessage `json:"flavor"`
-	MirrorMode                int             `json:"mirrorMode"`
-	PackageName               string          `json:"package_name"`
-	ProductType               int             `json:"productType"`
-	PxcVersion                string          `json:"pxcVersion"`
-	ScreenType                int             `json:"screenType"`
-	SdkVersion                string          `json:"sdkVersion"`
-	SocketTimeoutPeriodWifi   int             `json:"socketTimeoutPeriodWifi"`
-	SteeringMode              int             `json:"steeringMode"`
-	SupportBTCall             bool            `json:"supportBTCall"`
-	SupportBTSetting          bool            `json:"supportBTSetting"`
-	SupportBackDesktop        bool            `json:"supportBackDesktop"`
-	SupportBackDesktopNew     bool            `json:"supportBackDesktopNew"`
-	SupportConnect            int             `json:"supportConnect"`
-	SupportDownloadScreenEvt  bool            `json:"supportDownloadScreenEvt"`
-	SupportFunction           int             `json:"supportFunction"`
+	Flavor                   json.RawMessage `json:"flavor"`
+	MirrorMode               int             `json:"mirrorMode"`
+	PackageName              string          `json:"package_name"`
+	ProductType              int             `json:"productType"`
+	PxcVersion               string          `json:"pxcVersion"`
+	ScreenType               int             `json:"screenType"`
+	SdkVersion               string          `json:"sdkVersion"`
+	SocketTimeoutPeriodWifi  int             `json:"socketTimeoutPeriodWifi"`
+	SteeringMode             int             `json:"steeringMode"`
+	SupportBTCall            bool            `json:"supportBTCall"`
+	SupportBTSetting         bool            `json:"supportBTSetting"`
+	SupportBackDesktop       bool            `json:"supportBackDesktop"`
+	SupportBackDesktopNew    bool            `json:"supportBackDesktopNew"`
+	SupportConnect           int             `json:"supportConnect"`
+	SupportDownloadScreenEvt bool            `json:"supportDownloadScreenEvt"`
+	SupportFunction          int             `json:"supportFunction"`
+	// Kept raw: the official app tells "sent" from "absent" for these two (CI:887-890, 922-926).
+	SupportFunctionEx         json.RawMessage `json:"supportFunctionEx"`
+	SupportSpeechEngine       json.RawMessage `json:"supportSpeechEngine"`
 	SupportHID                bool            `json:"supportHID"`
 	SupportLandscapeAdaptive  bool            `json:"supportLandscapeAdaptive"`
 	SupportMic                bool            `json:"supportMic"`
@@ -232,6 +253,21 @@ func coerceJSON(field reflect.Value, raw json.RawMessage) {
 	}
 }
 
+// optLong reads one raw JSON field the way JSONObject.optLong / getInt do: a number, or text
+// holding one, truncated as Number.longValue() truncates. ok is false for anything else,
+// absence included.
+func optLong(raw json.RawMessage) (value int64, ok bool) {
+	var n json.Number
+	if len(raw) == 0 || json.Unmarshal(raw, &n) != nil {
+		return 0, false
+	}
+	if i, err := n.Int64(); err == nil {
+		return i, true
+	}
+	f, err := n.Float64()
+	return int64(f), err == nil
+}
+
 type PhoneConfig struct {
 	PxcVersion        string `json:"pxcVersion"`
 	PhoneUUID         string `json:"phoneUUID"`
@@ -252,7 +288,11 @@ type PhoneConfig struct {
 	// value it does compute went only into the RLY for MEDIA_CONTROL 0x60 - which
 	// firmware that runs supportExtendProtocol=0 never asks for, so on those units the
 	// number was never stated at all.
-	SupportFunction int `json:"supportFunction"`
+	//
+	// A pointer so the reply can leave it out: the official app omits it when it echoes
+	// supportFunctionEx instead (CI:1030-1036). The host's profile value otherwise.
+	SupportFunction   *int64 `json:"supportFunction,omitempty"`
+	SupportFunctionEx *int64 `json:"supportFunctionEx,omitempty"`
 	// There is deliberately no supportSyncCorrectTime here. It was added on
 	// 2026-08-10 on the theory that a Carbit dash only asks a phone that claims
 	// the capability, and removed the same day: the reference implementation
@@ -266,6 +306,40 @@ type PhoneConfig struct {
 	// the work is what caused harm. Do not re-add this without a rider log
 	// showing a dash that stays silent until it is claimed.
 	AppVersionFingerPrint string `json:"appVersionFingerPrint"`
+	// speechEngineType is the extra the official app adds to this reply (ec/b.java:564-567); sent
+	// only when the host asks for it (SetSpeechEngineType).
+	SpeechEngineType *int `json:"speechEngineType,omitempty"`
+}
+
+// supportFunctionExMask is CI.r(): the bits the official app never echoes back in
+// supportFunctionEx (ECP_C2P_CLIENT_INFO.java:486-488, 1035).
+const supportFunctionExMask = 0xFFBFFFDF
+
+// echoSupportFunction answers the dash's capabilities with its own, as the official app does
+// (CI:877-890, 1030-1036): supportFunctionEx & 0xFFBFFFDF and no supportFunction when the dash
+// sent an Ex; its supportFunction otherwise, 0 when it sent none (b0.O() for this build).
+func echoSupportFunction(conf *HUDConfig, pc *PhoneConfig) {
+	if ex, ok := optLong(conf.SupportFunctionEx); ok {
+		masked := ex & supportFunctionExMask
+		pc.SupportFunction, pc.SupportFunctionEx = nil, &masked
+		return
+	}
+	sf := int64(conf.SupportFunction)
+	pc.SupportFunction, pc.SupportFunctionEx = &sf, nil
+}
+
+// carbitSpeechEngineType is the value the official app puts in speechEngineType: the dash's
+// supportSpeechEngine, 2 when absent, and 2002 read as 2001 except on channel 16206 (XF06)
+// (CI:922-932, ec/b.java:566).
+func carbitSpeechEngineType(conf *HUDConfig) int {
+	engine, ok := optLong(conf.SupportSpeechEngine)
+	if !ok {
+		engine = 2
+	}
+	if engine == 2002 && conf.Channel != "16206" {
+		engine = 2001
+	}
+	return int(engine)
 }
 
 type PXCControl struct {
@@ -283,9 +357,12 @@ type PXCControl struct {
 	HudConfig   *HUDConfig
 	PhoneConfig *PhoneConfig
 
-	connections        sync.Map // map[net.Conn]*pxcConnectionState
+	connections        sync.Map    // map[net.Conn]*pxcConnectionState
+	tlsConfig          *tls.Config // what the phone serves on 0x107C0; nil: stay plaintext
+	tlsOn              atomic.Bool // this session switched to TLS; new phone channels follow
 	heartbeatInterval  time.Duration
 	proactiveHeartbeat bool
+	idleProbe          bool
 	timeZoneID         string
 	timeZoneOffsetSec  int
 	timeZoneOffsetSet  bool
@@ -320,6 +397,15 @@ type PXCControl struct {
 
 	clientInfoMu sync.Mutex
 
+	// What the CLIENT_INFO reply echoes of the dash's own; see SetEchoSupportFunction and
+	// SetSpeechEngineType.
+	echoSupportFunction bool
+	speechEngineType    int
+
+	// noFlavor51Lifecycle turns off what a flavor-51 dash gets by default; see carbitLifecycle.
+	noFlavor51Lifecycle bool
+	ecFrontOnce         sync.Once
+
 	// The phone channel and its one sender; see p2c.go and phoneChannel.
 	phoneMu    sync.Mutex
 	phone      net.Conn
@@ -333,6 +419,72 @@ type PXCControl struct {
 	// HeardElsewhere, when set before Start, reports the last time the dash said anything
 	// outside PXC - a video poll - so a dash still pulling frames is never judged dead.
 	HeardElsewhere func() time.Time
+	// OnTransport, when set before Start, receives this package's typed transport events
+	// (emitTransport). The host sees them as EventSourceTransport events with this cmd.
+	OnTransport func(cmd int, payload []byte)
+}
+
+// C2PHandler answers one request the dash sends on PXC (an even command), for a command the
+// switch in handleEvent does not name. It returns the body of the cmd+1 reply - nil for an empty
+// one, which is what CarbitRide answers nearly every command it handles with (v0.d(),
+// sdk/v0.java:50-66). An error is answered 0x80000020 {"errCode":-2147483648,"errMsg":...}, as
+// CarbitRide answers a handler that failed, typically on a body that is not JSON
+// (sdk/b1.java:126-144, om/c.java:24-37).
+//
+// It runs on the connection's reader goroutine before the reply is written: it must not block.
+// The request already reached the event stream; emitTransport is for a decoded, typed event.
+type C2PHandler func(s *PXCControl, req *PXCResponse) (reply []byte, err error)
+
+var (
+	c2pHandlersMu sync.RWMutex
+	c2pHandlers   = map[uint32]C2PHandler{}
+)
+
+// RegisterC2PHandler makes h the answer to dash command cmd. Call it from an init() in the file
+// that owns the command. A command the dispatch switch names itself cannot be taken over, and a
+// command registered twice is a programming error.
+func RegisterC2PHandler(cmd uint32, h C2PHandler) {
+	c2pHandlersMu.Lock()
+	defer c2pHandlersMu.Unlock()
+	if _, dup := c2pHandlers[cmd]; dup {
+		panic(fmt.Sprintf("C2P handler for 0x%x registered twice", cmd))
+	}
+	c2pHandlers[cmd] = h
+}
+
+func c2pHandler(cmd uint32) C2PHandler {
+	c2pHandlersMu.RLock()
+	defer c2pHandlersMu.RUnlock()
+	return c2pHandlers[cmd]
+}
+
+// pxcCmdError is the errCode CarbitRide puts in 0x80000020 for a handler that threw:
+// C.RATE_UNSET_INT, Integer.MIN_VALUE (km/h.java:30-34).
+const pxcCmdError = -2147483648
+
+// emitTransport hands the host one typed transport event; see OnTransport.
+func (s *PXCControl) emitTransport(cmd int, payload []byte) {
+	if s.OnTransport != nil {
+		s.OnTransport(cmd, payload)
+	}
+}
+
+// answerRegistered runs a registered handler and writes its reply on the connection it came in on.
+func (s *PXCControl) answerRegistered(h C2PHandler, event *PXCResponse, conn net.Conn) {
+	s.emitEvent(*event)
+	response := &PXCResponse{Command: event.Command + 1}
+	body, err := h(s, event)
+	if err != nil {
+		logging.Printf("PXC 0x%x: %v; answering 0x%x", event.Command, err, PxcStatusError)
+		body, _ = json.Marshal(map[string]any{"errCode": pxcCmdError, "errMsg": err.Error()})
+		response.Command = PxcStatusError
+	}
+	response.Body = body
+	if err := s.writeResponse(response, conn, nil); err != nil {
+		s.emitError(s.connectionError(conn, PxcWriteErr, err))
+	} else if body != nil {
+		s.emitEvent(*response)
+	}
 }
 
 type pxcConnectionState struct {
@@ -347,9 +499,13 @@ type pxcConnectionState struct {
 	channel     atomic.Value // string: "CAR_CTRL" | "CAR_DATA"
 	lastRxNanos atomic.Int64
 	beatsSince  atomic.Int64 // keepalives written since the dash last said anything
-	// superseded marks a phone channel the dash replaced with a newer one, so its closing is
-	// not reported as a failure.
+	// superseded marks a connection closed on purpose - a phone channel the dash replaced with a
+	// newer one, or one whose TLS switch failed and was reported - so its closing is not reported
+	// as a failure.
 	superseded atomic.Bool
+	// reader is the connection's buffered reader, owned by its read loop; a TLS switch takes over
+	// what it has buffered.
+	reader *bufio.Reader
 	// answered: the dash has answered a command of ours on this phone channel.
 	answered atomic.Bool
 	// dashBeats: the dash keeps this channel alive with heartbeats of its own.
@@ -433,6 +589,21 @@ func (s *PXCControl) SetSkipDashClockSync(skip bool) {
 // Configure it before Start.
 func (s *PXCControl) SetDashAsksForTime(asks bool) {
 	s.dashAsksForTime = asks
+}
+
+// SetEchoSupportFunction answers CLIENT_INFO with the dash's own supportFunction[Ex] the way the
+// official app does (echoSupportFunction), instead of the host's profile value. Off by default:
+// it claims every capability the dash offers, which the official app can back and a host may
+// not. Configure it before Start.
+func (s *PXCControl) SetEchoSupportFunction(echo bool) {
+	s.echoSupportFunction = echo
+}
+
+// SetSpeechEngineType adds speechEngineType to the CLIENT_INFO reply: 0 leaves it out (as every
+// earlier build did), a negative value sends what the official app sends
+// (carbitSpeechEngineType), a positive one is sent as given. Configure it before Start.
+func (s *PXCControl) SetSpeechEngineType(engine int) {
+	s.speechEngineType = engine
 }
 
 // queryTimeAckBody and huTimeSyncAckBody exist so the two clock answers cannot
@@ -532,6 +703,52 @@ func (s *PXCControl) maybeScheduleProactiveQueryTime(conn net.Conn) {
 			s.emitEvent(*response)
 		}()
 	})
+}
+
+// hudConfig is the dash's CLIENT_INFO, or nil before it, for readers off the connection that
+// stored it.
+func (s *PXCControl) hudConfig() *HUDConfig {
+	s.clientInfoMu.Lock()
+	defer s.clientInfoMu.Unlock()
+	return s.HudConfig
+}
+
+// dashChannel is CLIENT_INFO's channel, "" before it.
+func (s *PXCControl) dashChannel() string {
+	if conf := s.hudConfig(); conf != nil {
+		return conf.Channel
+	}
+	return ""
+}
+
+// flavor51 reports a dash whose CLIENT_INFO says flavor 51: CarbitRide's own family (the Zontes
+// JCDZ21 among them), the only one known to be built against the official app's phone side.
+func (s *PXCControl) flavor51() bool {
+	conf := s.hudConfig()
+	return conf != nil && strings.Trim(string(bytes.TrimSpace(conf.Flavor)), `"`) == "51"
+}
+
+// SetFlavor51Lifecycle controls what a flavor-51 dash gets without any profile asking: the
+// official app's APPSTATUS announcements and its switch to the mirror page at stream start
+// (carbitLifecycle), and its silence on 0x102B0. On by default; false restores the wire every
+// earlier build put in front of that dash. Configure it before Start.
+func (s *PXCControl) SetFlavor51Lifecycle(enabled bool) {
+	s.noFlavor51Lifecycle = !enabled
+}
+
+// flavor51Defaults reports a flavor-51 dash the host has not opted out of SetFlavor51Lifecycle.
+func (s *PXCControl) flavor51Defaults() bool {
+	return !s.noFlavor51Lifecycle && s.flavor51()
+}
+
+// carbitLifecycle reports whether this dash gets the official app's unsolicited lifecycle
+// commands: a profile asked for them (SetAppStatusNotify), or the dash is flavor 51. Every
+// other dashboard paints today without ever having seen one of them from us.
+func (s *PXCControl) carbitLifecycle() bool {
+	s.appStatus.mu.Lock()
+	enabled := s.appStatus.enabled
+	s.appStatus.mu.Unlock()
+	return enabled || s.flavor51Defaults()
 }
 
 func (s *PXCControl) connectionState(conn net.Conn) *pxcConnectionState {
@@ -709,22 +926,7 @@ func (s *PXCControl) writeResponse(res *PXCResponse, conn net.Conn, raw *[]byte)
 	defer state.writeMu.Unlock()
 
 	if raw == nil && res != nil {
-		// -- build header
-		res.Token = 0 // Padding is always 0 for responses
-		res.Size = pxcHeaderSize
-		if len(res.Body) > 0 {
-			res.Size = res.Size + uint32(len(res.Body))
-		}
-		res.Magic = res.Size ^ res.Command
-
-		// Header and body in one write, as the official app flushes them (sdk/i.java:149-163):
-		// four header writes on a TCP_NODELAY socket went out as four segments.
-		frame := make([]byte, pxcHeaderSize, int(res.Size))
-		binary.LittleEndian.PutUint32(frame[0:], res.Command)
-		binary.LittleEndian.PutUint32(frame[4:], res.Size)
-		binary.LittleEndian.PutUint32(frame[8:], res.Magic)
-		binary.LittleEndian.PutUint32(frame[12:], res.Token)
-		if _, err := conn.Write(append(frame, res.Body...)); err != nil {
+		if _, err := conn.Write(encodeFrame(res)); err != nil {
 			return err
 		}
 	} else if raw != nil {
@@ -734,6 +936,21 @@ func (s *PXCControl) writeResponse(res *PXCResponse, conn net.Conn, raw *[]byte)
 	}
 
 	return nil
+}
+
+// encodeFrame fills in res's header and returns header and body as one frame: one write, as the
+// official app flushes them (sdk/i.java:149-163) - four header writes on a TCP_NODELAY socket went
+// out as four segments.
+func encodeFrame(res *PXCResponse) []byte {
+	res.Token = 0 // Padding is always 0 for responses
+	res.Size = pxcHeaderSize + uint32(len(res.Body))
+	res.Magic = res.Size ^ res.Command
+	frame := make([]byte, pxcHeaderSize, int(res.Size))
+	binary.LittleEndian.PutUint32(frame[0:], res.Command)
+	binary.LittleEndian.PutUint32(frame[4:], res.Size)
+	binary.LittleEndian.PutUint32(frame[8:], res.Magic)
+	binary.LittleEndian.PutUint32(frame[12:], res.Token)
+	return append(frame, res.Body...)
 }
 
 // Keep the dash's request channel (CAR_CTRL) alive with empty 0x70000000 frames, for firmware
@@ -789,6 +1006,9 @@ func (s *PXCControl) handleEvent(event *PXCResponse, conn net.Conn) {
 		// Named before it is answered, not after: a write that fails here produces an error whose
 		// whole value is saying WHICH channel could not be answered.
 		s.nameChannel(conn, "CAR_CTRL")
+		// A new request channel starts plaintext, and so do phone channels opened after it until
+		// it asks again (sdk/h0.java:104-112).
+		s.tlsOn.Store(false)
 		// Emitted so a rider's log shows which channels the dash opened at all - their
 		// absence from every export is what let phone commands go out on the wrong one.
 		s.emitEvent(*event)
@@ -803,7 +1023,13 @@ func (s *PXCControl) handleEvent(event *PXCResponse, conn net.Conn) {
 		s.nameChannel(conn, "CAR_DATA")
 		s.emitEvent(*event)
 		response := &PXCResponse{Command: PxcChannelCarData + 1}
-		if err := s.writeResponse(response, conn, nil); err != nil {
+		if s.tlsOn.Load() {
+			// The plaintext 0x20001, then TLS, before anything of ours goes out on it: CarbitRide's
+			// P2C sender switches its socket when it starts (sdk/x0.java:175, h0.java:122-133).
+			if !s.switchToTLS(conn, response) {
+				return
+			}
+		} else if err := s.writeResponse(response, conn, nil); err != nil {
 			s.emitError(s.connectionError(conn, PxcWriteErr, err))
 			return
 		}
@@ -815,9 +1041,11 @@ func (s *PXCControl) handleEvent(event *PXCResponse, conn net.Conn) {
 		s.startP2C()
 		// The official app's first APPSTATUS goes out as soon as this channel is up
 		// (b0.r -> ec/v -> t0.q0), before any capture is negotiated.
-		s.SendAppStatus(AppStatusBackground)
+		s.announceAppStatus()
 	case PxcHudConf:
 		s.answerClientInfo(event, conn)
+	case PxcStartTLS:
+		s.answerStartTLS(event, conn)
 	case PxcSpeedConf:
 		s.emitEvent(*event)
 		response := &PXCResponse{Command: PxcSpeedOk}
@@ -915,7 +1143,16 @@ func (s *PXCControl) handleEvent(event *PXCResponse, conn net.Conn) {
 		// a rider's own diagnostics export can ever show the reply happened.
 		s.emitEvent(*response)
 	default:
-		if event.Command&1 == 0 {
+		if h := c2pHandler(event.Command); h != nil && event.Command&1 == 0 {
+			s.answerRegistered(h, event, conn)
+		} else if event.Command == PxcTboxSerial && s.flavor51Defaults() {
+			// CarbitRide answers nothing to 0x102B0, not even an error (v0.f(),
+			// sdk/v0.java:77-80): a stray 0x102B1 can read as the answer to the dash's next
+			// request. Only for flavor 51: the body reads like a CFMOTO T-Box notice, and CFDL26
+			// waits for cmd+1 on the notices it sends.
+			logging.Printf("PXC 0x%x from a flavor-51 dash: not answered, as the official app does not", event.Command)
+			s.emitEvent(*event)
+		} else if event.Command&1 == 0 {
 			// Unknown even commands are requests. CFDL26 uses several JSON and
 			// binary notifications here and will not open 10921/10920 until ACKed.
 			//
@@ -969,6 +1206,8 @@ func (s *PXCControl) answerClientInfo(event *PXCResponse, conn net.Conn) {
 	}
 	s.emitEvent(*response)
 	s.maybeScheduleProactiveQueryTime(conn)
+	// A phone channel opened before CLIENT_INFO could not tell a flavor-51 dash yet.
+	s.announceAppStatus()
 }
 
 func (s *PXCControl) clientInfoReply(body []byte) ([]byte, error) {
@@ -986,6 +1225,16 @@ func (s *PXCControl) clientInfoReply(body []byte) ([]byte, error) {
 		// Set encrypted huid to phone config
 		if err := s.buildPC(); err != nil {
 			return nil, err
+		}
+		if s.echoSupportFunction {
+			echoSupportFunction(&conf, s.PhoneConfig)
+		}
+		s.PhoneConfig.SpeechEngineType = nil
+		if engine := s.speechEngineType; engine != 0 {
+			if engine < 0 {
+				engine = carbitSpeechEngineType(&conf)
+			}
+			s.PhoneConfig.SpeechEngineType = &engine
 		}
 	} else {
 		// The dash sends CLIENT_INFO again when it reopens 0x10000 after a Wi-Fi blip, and
@@ -1029,7 +1278,7 @@ func (s *PXCControl) acceptLoop() {
 
 		logging.Printf("New PXC client from %s", conn.RemoteAddr())
 		s.wg.Add(1)
-		go s.handleConn(conn)
+		go s.handleConn(&pxcConn{Conn: conn})
 	}
 }
 
@@ -1045,6 +1294,7 @@ func (s *PXCControl) handleConn(conn net.Conn) {
 	}()
 
 	reader := bufio.NewReader(conn)
+	state.reader = reader
 
 	// Retire the connection before judging the failure, never after. When the
 	// dash really goes away every channel fails at once, and whichever one is

@@ -3,6 +3,7 @@ package net
 import (
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"io"
 	stdnet "net"
 	"strings"
@@ -624,4 +625,55 @@ func TestTheDemotedPxcNoticeNamesTheAbandonedChannel(t *testing.T) {
 	if !strings.Contains(err.Error(), "keepalive") {
 		t.Fatalf("the notice does not say the dash had stopped answering it: %v", err)
 	}
+}
+
+// Test-only commands for the C2P handler registry; registered once, as a feature file would.
+const (
+	testC2PEcho   uint32 = 0x1FFE0
+	testC2PBroken uint32 = 0x1FFF0
+)
+
+func init() {
+	RegisterC2PHandler(testC2PEcho, func(s *PXCControl, req *PXCResponse) ([]byte, error) {
+		s.emitTransport(int(req.Command), req.Body)
+		return []byte(`{"seen":true}`), nil
+	})
+	RegisterC2PHandler(testC2PBroken, func(*PXCControl, *PXCResponse) ([]byte, error) {
+		return nil, errors.New("not JSON")
+	})
+}
+
+// A registered handler answers its command with cmd+1 and its body, and may emit a typed event;
+// one that fails is answered 0x80000020 the way CarbitRide answers a handler that threw.
+func TestRegisteredC2PHandlersAnswerTheirCommand(t *testing.T) {
+	control := NewPXCControl(":0", nil, nil)
+	var transport []int
+	control.OnTransport = func(cmd int, _ []byte) { transport = append(transport, cmd) }
+
+	got := handlePXCEventAndReadResponses(t, control, &PXCResponse{Command: testC2PEcho, Body: []byte(`{}`)}, 1)[0]
+	if got.Command != testC2PEcho+1 || string(got.Body) != `{"seen":true}` {
+		t.Fatalf("reply = 0x%x %s", got.Command, got.Body)
+	}
+	if len(transport) != 1 || transport[0] != int(testC2PEcho) {
+		t.Fatalf("transport events = %v", transport)
+	}
+
+	got = handlePXCEventAndReadResponses(t, control, &PXCResponse{Command: testC2PBroken, Body: []byte(`x`)}, 1)[0]
+	var body struct {
+		ErrCode int64  `json:"errCode"`
+		ErrMsg  string `json:"errMsg"`
+	}
+	if got.Command != PxcStatusError || json.Unmarshal(got.Body, &body) != nil || body.ErrCode != pxcCmdError || body.ErrMsg == "" {
+		t.Fatalf("failed handler reply = 0x%x %s", got.Command, got.Body)
+	}
+	assertNoPXCError(t, control)
+}
+
+func TestRegisteringACommandTwicePanics(t *testing.T) {
+	defer func() {
+		if recover() == nil {
+			t.Fatal("a second handler for the same command was accepted")
+		}
+	}()
+	RegisterC2PHandler(testC2PEcho, func(*PXCControl, *PXCResponse) ([]byte, error) { return nil, nil })
 }
