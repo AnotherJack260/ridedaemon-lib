@@ -2,6 +2,7 @@ package net
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/binary"
@@ -10,6 +11,9 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"reflect"
+	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -25,6 +29,11 @@ import (
 const (
 	pxcHeaderSize             = 16
 	defaultPxcHeartbeatPeriod = 2 * time.Second
+	// maxPxcBodySize bounds what one frame may declare. CarbitRide allocates whatever the
+	// header says (sdk/i.java:101-108); a garbled length would take the whole app down here.
+	// ponytail: the dash's own bodies are control JSON of a few KB; raise it if one is seen
+	// closing on a real frame.
+	maxPxcBodySize = 4 << 20
 )
 
 // Command requests
@@ -142,6 +151,70 @@ type HUDConfig struct {
 	VersionCode               string          `json:"version_code"`
 	VersionName               string          `json:"version_name"`
 	WakeUpWord                string          `json:"wakeupWord"`
+}
+
+// decodeLenient fills v from a JSON object the way the official app's opt* getters read
+// CLIENT_INFO (ECP_C2P_CLIENT_INFO.java:744-975): a field of an unexpected JSON type is
+// coerced where it can be and left at zero where it cannot, instead of failing the whole
+// object. An empty body is an empty object, as it is there (:737-743). Only a body that is
+// not a JSON object at all is an error.
+func decodeLenient(data []byte, v any) error {
+	if len(bytes.TrimSpace(data)) == 0 {
+		return nil
+	}
+	err := json.Unmarshal(data, v)
+	var typeErr *json.UnmarshalTypeError
+	if err == nil || !errors.As(err, &typeErr) {
+		return err
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		return err
+	}
+	rv := reflect.ValueOf(v).Elem()
+	for i := 0; i < rv.NumField(); i++ {
+		name, _, _ := strings.Cut(rv.Type().Field(i).Tag.Get("json"), ",")
+		raw, ok := fields[name]
+		if !ok || json.Unmarshal(raw, rv.Field(i).Addr().Interface()) == nil {
+			continue
+		}
+		coerceJSON(rv.Field(i), raw)
+	}
+	return nil
+}
+
+// coerceJSON is JSONObject.optString / optInt / optBoolean: anything reads as text, numbers
+// and numeric text read as integers truncated the way Number.intValue() truncates (so a
+// supportFunction above 2^31 still decodes on the 32-bit ABI), and only true or "true" is true.
+func coerceJSON(field reflect.Value, raw json.RawMessage) {
+	var value any
+	if json.Unmarshal(raw, &value) != nil || value == nil {
+		return
+	}
+	text, isText := value.(string)
+	number, isNumber := value.(float64)
+	if isText {
+		if parsed, err := strconv.ParseFloat(strings.TrimSpace(text), 64); err == nil {
+			number, isNumber = parsed, true
+		}
+	}
+	switch field.Kind() {
+	case reflect.String:
+		if !isText {
+			text = string(bytes.TrimSpace(raw))
+		}
+		field.SetString(text)
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		if isNumber {
+			field.SetInt(int64(number))
+		}
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		if isNumber && number >= 0 {
+			field.SetUint(uint64(number))
+		}
+	case reflect.Bool:
+		field.SetBool(value == true || strings.EqualFold(text, "true"))
+	}
 }
 
 type PhoneConfig struct {
@@ -588,9 +661,6 @@ func (s *PXCControl) buildPC() error {
 	if s.HudConfig == nil {
 		return errors.New("hudConfig is nil")
 	}
-	if s.HudConfig.HUID == "" {
-		return errors.New("hudConfig.HUID is empty")
-	}
 
 	// Set public key
 	if pubK, err := s.KeyPair.GetPublicEncoded(); err != nil {
@@ -599,9 +669,14 @@ func (s *PXCControl) buildPC() error {
 		s.PhoneConfig.Pubkey = pubK
 	}
 
-	// Encrypt HUID
+	// Encrypt HUID. An empty or unencryptable one is sent as "", which is what the official
+	// app does (RSAUtil.encryptHUID, RSAUtil.java:91-105) - it used to end the session here.
+	s.PhoneConfig.EncryptedHUID = ""
+	if s.HudConfig.HUID == "" {
+		return nil
+	}
 	if enc, err := LegacyPrivateEncryptPKCS1v15(&s.KeyPair.PrivateKey, []byte(s.HudConfig.HUID)); err != nil {
-		return err
+		logging.Printf("PXC CLIENT_INFO: HUID not encrypted (%v); sending it empty", err)
 	} else {
 		s.PhoneConfig.EncryptedHUID = base64.StdEncoding.EncodeToString(enc)
 	}
@@ -622,25 +697,15 @@ func (s *PXCControl) writeResponse(res *PXCResponse, conn net.Conn, raw *[]byte)
 		}
 		res.Magic = res.Size ^ res.Command
 
-		// -- write header
-		if err := binary.Write(conn, binary.LittleEndian, res.Command); err != nil {
+		// Header and body in one write, as the official app flushes them (sdk/i.java:149-163):
+		// four header writes on a TCP_NODELAY socket went out as four segments.
+		frame := make([]byte, pxcHeaderSize, int(res.Size))
+		binary.LittleEndian.PutUint32(frame[0:], res.Command)
+		binary.LittleEndian.PutUint32(frame[4:], res.Size)
+		binary.LittleEndian.PutUint32(frame[8:], res.Magic)
+		binary.LittleEndian.PutUint32(frame[12:], res.Token)
+		if _, err := conn.Write(append(frame, res.Body...)); err != nil {
 			return err
-		}
-		if err := binary.Write(conn, binary.LittleEndian, res.Size); err != nil {
-			return err
-		}
-		if err := binary.Write(conn, binary.LittleEndian, res.Magic); err != nil {
-			return err
-		}
-		if err := binary.Write(conn, binary.LittleEndian, res.Token); err != nil {
-			return err
-		}
-
-		// -- write body
-		if len(res.Body) > 0 {
-			if _, err := conn.Write(res.Body); err != nil {
-				return err
-			}
 		}
 	} else if raw != nil {
 		if _, err := conn.Write(*raw); err != nil {
@@ -728,22 +793,29 @@ func (s *PXCControl) handleEvent(event *PXCResponse, conn net.Conn) {
 		// (b0.r -> ec/v -> t0.q0), before any capture is negotiated.
 		s.SendAppStatus(AppStatusBackground)
 	case PxcHudConf:
-		if s.HudConfig != nil {
-			break
-		}
 		s.emitEvent(*event)
-		// Read HudConfig and store it
-		var conf HUDConfig
-		if err := json.Unmarshal(event.Body, &conf); err != nil {
-			s.emitError(&PxcError{PxcHudCfgErr, err, true})
-			break
-		}
-		s.HudConfig = &conf
-		s.noteSocketTimeout(conf.SocketTimeoutPeriodWifi)
-		// Set encrypted huid to phone config
-		if err := s.buildPC(); err != nil {
-			s.emitError(&PxcError{PxcHudCfgErr, err, true})
-			break
+		if s.HudConfig == nil {
+			// Read HudConfig and store it, leniently (see decodeLenient): a field of a type
+			// this struct did not expect used to end the session right after the handshake.
+			var conf HUDConfig
+			if err := decodeLenient(event.Body, &conf); err != nil {
+				s.emitError(&PxcError{PxcHudCfgErr, err, true})
+				break
+			}
+			s.HudConfig = &conf
+			s.noteSocketTimeout(conf.SocketTimeoutPeriodWifi)
+			// Set encrypted huid to phone config
+			if err := s.buildPC(); err != nil {
+				s.emitError(&PxcError{PxcHudCfgErr, err, true})
+				break
+			}
+		} else {
+			// The dash sends CLIENT_INFO again when it reopens 0x10000 after a Wi-Fi blip, and
+			// waits on its connect page for the reply. The official app answers every one
+			// (sdk/b0.java:435-448, ECP_C2P_CLIENT_INFO.java:1058); this ignored all but the
+			// first. ponytail: the first one's config is kept - same dash, same HUID; re-parse
+			// if a dash is ever seen changing it mid-session.
+			logging.Printf("PXC CLIENT_INFO again; answering it with this session's reply")
 		}
 		// Respond with phone conf
 		if b, err := json.Marshal(s.PhoneConfig); err != nil {
@@ -774,7 +846,7 @@ func (s *PXCControl) handleEvent(event *PXCResponse, conn net.Conn) {
 
 		var request checkSnRequest
 		if len(event.Body) > 0 {
-			if err := json.Unmarshal(event.Body, &request); err != nil {
+			if err := decodeLenient(event.Body, &request); err != nil {
 				s.emitError(&PxcError{PxcDecodeErr, fmt.Errorf("decode CHECK_SN: %w", err), false})
 			}
 		}
@@ -961,9 +1033,17 @@ func (s *PXCControl) handleConn(conn net.Conn) {
 		}
 		s.noteHeard(state)
 
-		// Sanity check
+		// Sanity check. The official app closes the socket on a bad magic or a size under the
+		// header (sdk/i.java:97-105, MagicError / LengthError); this used to close silently on
+		// the first and crash the app on the second, a size of 1-15 underflowing make(). Both,
+		// and a size no frame could have, now close and say so. Size 0 stays a header-only
+		// frame, as it always was here.
 		if request.Magic != request.Size^request.Command {
-			logging.Printf("Sanity check failed: %d %d", request.Magic, request.Command)
+			fail(PxcDecodeErr, fmt.Errorf("bad PXC frame magic 0x%x for command 0x%x size %d", request.Magic, request.Command, request.Size))
+			return
+		}
+		if request.Size != 0 && (request.Size < pxcHeaderSize || request.Size-pxcHeaderSize > maxPxcBodySize) {
+			fail(PxcDecodeErr, fmt.Errorf("bad PXC frame size %d for command 0x%x", request.Size, request.Command))
 			return
 		}
 

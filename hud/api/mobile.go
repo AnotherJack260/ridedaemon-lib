@@ -44,7 +44,9 @@ func BuildAnnexBAUFromAVCC(avcc []byte) ([]byte, error) {
 		}
 		nalLen := int(binary.BigEndian.Uint32(avcc[i : i+4]))
 		i += 4
-		if nalLen == 0 || i+nalLen > len(avcc) { // Truncated / malformed sample
+		// Compared without i+nalLen: on the 32-bit ABI a length near 2^31 is negative or
+		// overflows the sum, and either way the slice below would panic.
+		if nalLen <= 0 || nalLen > len(avcc)-i { // Truncated / malformed sample
 			return nil, fmt.Errorf("invalid AVCC NAL length")
 		}
 

@@ -329,6 +329,15 @@ func (s *MediaStream) handleConn(conn net.Conn) {
 		}
 
 		cmd := binary.LittleEndian.Uint16(header[0:2])
+		// The header's i16 length says how much body follows; the official app reads and
+		// drops it (base/q0.java:1055-1061). Leaving it in the stream would read it as the
+		// next poll and desync every frame after.
+		if bodyLen := int16(binary.LittleEndian.Uint16(header[2:4])); bodyLen > 0 {
+			if _, err := io.CopyN(io.Discard, input, int64(bodyLen)); err != nil {
+				fail(StrmDecodeErr, fmt.Errorf("error reading poll body: %v", err))
+				return
+			}
+		}
 
 		if cmd != 0x0072 {
 			// Not a poll pacing command, discard and send idle 0's

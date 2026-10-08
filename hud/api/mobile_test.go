@@ -96,3 +96,13 @@ func TestSendPhoneCommandBeforeTheSessionRunsIsAnError(t *testing.T) {
 		t.Fatalf("SendPhoneCommand = %+v, %v; want an error", reply, err)
 	}
 }
+
+// NAL lengths a broken sample can carry, including the ones that wrap a 32-bit int.
+func TestBuildAnnexBAUFromAVCCRejectsImpossibleLengths(t *testing.T) {
+	for _, length := range []uint32{0, 0x7FFFFFFF, 0x80000000, 0xFFFFFFFF} {
+		sample := []byte{byte(length >> 24), byte(length >> 16), byte(length >> 8), byte(length), 0x65, 1, 2}
+		if _, err := BuildAnnexBAUFromAVCC(sample); err == nil {
+			t.Errorf("NAL length 0x%x accepted", length)
+		}
+	}
+}
