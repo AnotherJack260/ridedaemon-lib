@@ -296,8 +296,8 @@ func (hud *CfmotoHUD) SetJpegStills(enabled bool) {
 
 // SetAppStatusNotify makes the phone announce its mirroring state to the head unit the
 // way the official app does - once when PXC comes up, and again when the dash starts
-// pulling frames. Off by default; configure it before StartStream. See
-// hud/net/appstatus.go.
+// pulling frames - for any dash. A flavor-51 dash gets it without this (SetFlavor51Lifecycle);
+// every other dash only with it. Configure it before StartStream. See hud/net/appstatus.go.
 func (hud *CfmotoHUD) SetAppStatusNotify(enabled bool) {
 	hud.mu.Lock()
 	defer hud.mu.Unlock()
