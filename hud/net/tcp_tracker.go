@@ -8,6 +8,7 @@ import (
 type ConnTracker struct {
 	mu          sync.Mutex
 	connections map[net.Conn]struct{}
+	closed      bool // CloseAll has run: the server is stopping
 }
 
 // listenOn is preset when a server was handed one (SetListener), else a new listener on port.
@@ -24,10 +25,16 @@ func NewConnTracker() *ConnTracker {
 	}
 }
 
+// Add tracks conn, or closes it when CloseAll has already run: a dash that connects as the server
+// stops reaches its handler after CloseAll, and nothing else would ever end that read.
 func (t *ConnTracker) Add(conn net.Conn) {
 	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.closed {
+		_ = conn.Close()
+		return
+	}
 	t.connections[conn] = struct{}{}
-	t.mu.Unlock()
 }
 
 func (t *ConnTracker) Remove(conn net.Conn) {
@@ -58,6 +65,7 @@ func (t *ConnTracker) CloseAll() {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
+	t.closed = true
 	for c := range t.connections {
 		_ = c.Close()
 	}

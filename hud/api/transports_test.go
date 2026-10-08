@@ -153,8 +153,8 @@ func pxc(cmd uint32, body []byte) []byte {
 
 // useEphemeralPorts serves the session on loopback listeners the test holds from now until the
 // session stops them, and routes the adb tunnel's tcp:10922/10921/10920 there: no fixed port to
-// race another process for, and nothing to skip.
-func useEphemeralPorts(t *testing.T, session *MobileSession) {
+// race another process for, and nothing to skip. It returns their addresses in that order.
+func useEphemeralPorts(t *testing.T, session *MobileSession) (addrs []string) {
 	t.Helper()
 	listeners := map[string]stdnet.Listener{}
 	for _, service := range []string{"tcp:10922", "tcp:10921", "tcp:10920"} {
@@ -164,6 +164,7 @@ func useEphemeralPorts(t *testing.T, session *MobileSession) {
 		}
 		t.Cleanup(func() { _ = ln.Close() })
 		listeners[service] = ln
+		addrs = append(addrs, ln.Addr().String())
 	}
 	if err := session.hud.SetListeners(listeners["tcp:10922"], listeners["tcp:10921"], listeners["tcp:10920"]); err != nil {
 		t.Fatal(err)
@@ -175,6 +176,7 @@ func useEphemeralPorts(t *testing.T, session *MobileSession) {
 		}
 		return stdnet.Dial("tcp", ln.Addr().String())
 	}
+	return addrs
 }
 
 // An MCU-Lite dash over USB, end to end through a real session: adb on the accessory stream,

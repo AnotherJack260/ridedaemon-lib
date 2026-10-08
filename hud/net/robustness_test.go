@@ -396,3 +396,16 @@ func TestZontesSessionGetsTheOfficialLifecycle(t *testing.T) {
 	}
 	assertSilent(t, ctrl, "the Zontes request channel")
 }
+
+// A dash that connects as a server stops reaches the handler after Stop's CloseAll; the tracker
+// closes it on arrival, or that handler's read - and Stop waiting on it - never ends.
+func TestConnTrackerClosesAConnectionAddedAfterCloseAll(t *testing.T) {
+	tracker := NewConnTracker()
+	tracker.CloseAll()
+	phone, dash := stdnet.Pipe()
+	defer dash.Close()
+	tracker.Add(phone)
+	if _, err := phone.Write([]byte{0}); err == nil {
+		t.Fatal("a connection added after CloseAll was left open")
+	}
+}

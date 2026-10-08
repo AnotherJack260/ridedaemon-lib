@@ -31,7 +31,8 @@ func (hud *CfmotoHUD) MCULite() *net.MCULite {
 
 // StartStreamOverLink opens the reverse servers without the EC init on 10930 and runs afterListen
 // once they listen; the dash comes to them through a link the host owns (the USB adb tunnel).
-// Like StartStream, it returns once the dash has completed the PXC handshake.
+// Like StartStream, it returns once the dash has completed the PXC handshake. afterListen must
+// not call StopStream itself: a stop waits for the pending start, which waits for afterListen.
 func (hud *CfmotoHUD) StartStreamOverLink(ctx context.Context, afterListen func() error) error {
 	return hud.startStream(ctx, nil, afterListen)
 }

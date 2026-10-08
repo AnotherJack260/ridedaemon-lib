@@ -414,6 +414,7 @@ func (ms *MobileSession) StartSessionWithSocketFd(fd int64) error {
 		_ = conn.Close()
 		return fmt.Errorf("unable to release EC init descriptor: %w", closeErr)
 	}
+	defer conn.Close() // the EC init closes it too; this covers a start refused before the init
 
 	ctxWithTimeout, cancel := context.WithTimeout(context.Background(), time.Duration(ms.cfg.StartupTimeoutSec)*time.Second)
 	defer cancel()

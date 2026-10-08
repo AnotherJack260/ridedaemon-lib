@@ -77,6 +77,9 @@ type HudEvent struct {
 	Data   any
 }
 
+// ErrStopped is what a start returns when StopStream ended it before the dash had connected.
+var ErrStopped = errors.New("stopped while starting")
+
 type StoppableServer interface {
 	Start() error
 	Stop(ctx context.Context) error
@@ -131,6 +134,10 @@ type CfmotoHUD struct {
 	mcuLite      *net.MCULite // nil unless the host enabled MCU-Lite (transports.go)
 	// listeners, when set, are served instead of 10922, 10921 and 10920; see SetListeners.
 	listeners []stdnet.Listener
+	// cancelStart and startDone are set while a start is in flight: StopStream cancels it and
+	// waits on startDone, which closes once that start has stopped whatever it opened.
+	cancelStart context.CancelCauseFunc
+	startDone   chan struct{}
 
 	// Streaming
 	muxSource *stream.MuxSource
@@ -547,7 +554,7 @@ func (hud *CfmotoHUD) StartStreamWithInitConn(ctx context.Context, initConn stdn
 // afterListen, when set, replaces the EC init: it runs once the reverse servers listen.
 func (hud *CfmotoHUD) startStream(ctx context.Context, initConn stdnet.Conn, afterListen func() error) (err error) {
 	hud.mu.Lock()
-	if hud.running {
+	if hud.running || hud.startDone != nil {
 		hud.mu.Unlock()
 		return errors.New("already running")
 	}
@@ -559,7 +566,19 @@ func (hud *CfmotoHUD) startStream(ctx context.Context, initConn stdnet.Conn, aft
 		hud.mu.Unlock()
 		return errors.New("mux source is not set")
 	}
+	ctx, cancel := context.WithCancelCause(ctx)
+	startDone := make(chan struct{})
+	hud.cancelStart, hud.startDone = cancel, startDone
 	hud.mu.Unlock()
+	// Deferred first, so it runs last: a StopStream waiting on startDone returns only once the
+	// cleanup below has closed the listeners.
+	defer func() {
+		cancel(nil)
+		hud.mu.Lock()
+		hud.cancelStart, hud.startDone = nil, nil
+		hud.mu.Unlock()
+		close(startDone)
+	}()
 
 	if hud.keyPair = hud.identityKey; hud.keyPair == nil {
 		if hud.keyPair, err = net.GenKeyPair(); err != nil {
@@ -570,11 +589,12 @@ func (hud *CfmotoHUD) startStream(ctx context.Context, initConn stdnet.Conn, aft
 	sf := int64(hud.supportFunction)
 	hud.phoneConfig.SupportFunction, hud.phoneConfig.SupportFunctionEx = &sf, nil
 
-	var started []StoppableServer
+	var servers []StoppableServer
 
-	// If err != nil on exit, stop everything still running
+	// If err != nil on exit, stop every server, started or not: Stop on one that never started
+	// still closes its injected listener and the channels its forwarding goroutines range over.
 	defer func() {
-		if err == nil || len(started) == 0 {
+		if err == nil || len(servers) == 0 {
 			return
 		}
 
@@ -582,9 +602,9 @@ func (hud *CfmotoHUD) startStream(ctx context.Context, initConn stdnet.Conn, aft
 		defer cancel()
 
 		// stop reverse order
-		for i := len(started) - 1; i >= 0; i-- {
-			if stopErr := started[i].Stop(shutdownCtx); stopErr != nil {
-				logging.Printf("Error stopping server %T: %v", started[i], stopErr)
+		for i := len(servers) - 1; i >= 0; i-- {
+			if stopErr := servers[i].Stop(shutdownCtx); stopErr != nil {
+				logging.Printf("Error stopping server %T: %v", servers[i], stopErr)
 			}
 		}
 
@@ -735,8 +755,8 @@ func (hud *CfmotoHUD) startStream(ctx context.Context, initConn stdnet.Conn, aft
 	}()
 	hud.startMediaEventFwd(mediaControl)
 
-	servers := []StoppableServer{pxcServer, mediaStream, mediaControl}
-	started, err = startReverseServersThenInit(servers, func() error {
+	servers = []StoppableServer{pxcServer, mediaStream, mediaControl}
+	_, err = startReverseServersThenInit(servers, func() error {
 		if afterListen != nil {
 			return afterListen()
 		}
@@ -745,9 +765,9 @@ func (hud *CfmotoHUD) startStream(ctx context.Context, initConn stdnet.Conn, aft
 			hud.host.Ip, hud.host.Port, hud.host.Package, hud.phoneConfig.PhoneOs,
 		)
 		if initConn != nil {
-			return hud.ecService.InitStreamCmdWithConn(initConn)
+			return hud.ecService.InitStreamCmdWithConn(ctx, initConn)
 		}
-		return hud.ecService.InitStreamCmd()
+		return hud.ecService.InitStreamCmd(ctx)
 	})
 	if err != nil {
 		hud.ecService = nil
@@ -759,10 +779,14 @@ func (hud *CfmotoHUD) startStream(ctx context.Context, initConn stdnet.Conn, aft
 	case <-pxcReady:
 		break
 	case <-ctx.Done():
-		return ctx.Err()
+		return context.Cause(ctx)
 	}
 
 	hud.mu.Lock()
+	if ctx.Err() != nil { // StopStream came in as the dash finished the handshake
+		hud.mu.Unlock()
+		return context.Cause(ctx)
+	}
 	hud.pxcControl = pxcServer
 	hud.mediaStream = mediaStream
 	hud.mediaControl = mediaControl
@@ -791,7 +815,20 @@ func startReverseServersThenInit(
 func (hud *CfmotoHUD) StopStream(ctx context.Context) error {
 	hud.mu.Lock()
 	if !hud.running {
+		// A start still waiting for the dash holds the listeners until it gives up; end it
+		// now and wait for it, so the ports are free when this returns. Cancelled under the
+		// lock: the start checks its context under it too before it sets running.
+		startDone := hud.startDone
+		if hud.cancelStart != nil {
+			hud.cancelStart(ErrStopped)
+		}
 		hud.mu.Unlock()
+		if startDone != nil {
+			select {
+			case <-startDone:
+			case <-ctx.Done():
+			}
+		}
 		hud.stopOnce.Do(func() {
 			close(hud.stopped)
 		})

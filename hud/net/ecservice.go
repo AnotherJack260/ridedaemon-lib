@@ -2,13 +2,15 @@ package net
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"time"
+
+	"github.com/charliecharlieO-o/ridedaemon-go/internal/logging"
 )
 
 const initCmd int = 16
@@ -93,30 +95,49 @@ func readECResponse(r io.Reader) (*ECResponse, error) {
 	return (&ECService{}).decodePayload(append(header, body...))
 }
 
-func (s *ECService) InitStreamCmd() error {
+// InitStreamCmd dials the dash's EasyConn port and performs the init handshake. Ending ctx ends
+// it, dial included, and it then returns context.Cause(ctx).
+func (s *ECService) InitStreamCmd(ctx context.Context) error {
 	addr := net.JoinHostPort(s.ip, s.port)
-	conn, err := net.DialTimeout("tcp", addr, time.Second*5)
+	conn, err := (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, "tcp", addr)
 	if err != nil {
+		if ctx.Err() != nil {
+			return context.Cause(ctx)
+		}
 		return err
 	}
-	return s.initStreamCmd(conn)
+	return s.initStreamCmd(ctx, conn)
 }
 
 // InitStreamCmdWithConn performs the normal EasyConn init handshake over a caller-owned route.
-// Android callers use this to pass a socket opened by Network.socketFactory.
-func (s *ECService) InitStreamCmdWithConn(conn net.Conn) error {
+// Android callers use this to pass a socket opened by Network.socketFactory. It always closes
+// conn, at the latest when ctx ends.
+func (s *ECService) InitStreamCmdWithConn(ctx context.Context, conn net.Conn) error {
 	if conn == nil {
 		return fmt.Errorf("nil EC init connection")
 	}
-	return s.initStreamCmd(conn)
+	return s.initStreamCmd(ctx, conn)
 }
 
-func (s *ECService) initStreamCmd(conn net.Conn) (err error) {
-	defer func(conn net.Conn) {
-		if err = conn.Close(); err != nil {
-			log.Println(err)
+func (s *ECService) initStreamCmd(ctx context.Context, conn net.Conn) (err error) {
+	// Closing the socket is the only thing that ends a read the dash never answers: a stopped
+	// start must not sit out the deadline below with the reverse ports still bound.
+	stopClosing := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer func() {
+		stopClosing()
+		closeErr := conn.Close()
+		if ctx.Err() != nil {
+			err = context.Cause(ctx)
+			return
 		}
-	}(conn)
+		// ponytail: this defer has always returned Close's result in place of the handshake's,
+		// so an init the dash never answers (or refuses) still goes on to the PXC wait. Kept as
+		// the field has always had it, now logged; fail here if no dash turns out to need it.
+		if err != nil {
+			logging.Printf("EasyConn init: %v; waiting for the dash's PXC connection anyway", err)
+		}
+		err = closeErr
+	}()
 
 	// Send init payload
 	if err = conn.SetDeadline(time.Now().Add(time.Second * 5)); err != nil {
