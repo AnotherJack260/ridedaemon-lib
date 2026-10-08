@@ -9,6 +9,7 @@ import (
 	"fmt"
 	stdnet "net"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"github.com/charliecharlieO-o/ridedaemon-go/hud/core"
@@ -195,6 +196,9 @@ type MobileSession struct {
 	streamer *stream.AUStreamer
 
 	stopped chan struct{}
+
+	// features is the DashFeatures made for this session (NewDashFeatures); relayEvent feeds it.
+	features atomic.Pointer[DashFeatures]
 }
 
 func NewMobileSession(cfg *MobileConfig, cb MobileCallback) (*MobileSession, error) {
@@ -325,6 +329,11 @@ func (ms *MobileSession) relayEvent(evt core.HudEvent) {
 		payload = append([]byte(nil), data...)
 	}
 
+	// Queued here, before OnEvent, so the features see the dash's commands in the order it sent
+	// them; they run on their own worker, so a listener that blocks never holds up this relay.
+	if f := ms.features.Load(); f != nil && evt.Source == core.EventSourcePXC {
+		f.enqueue(timestamp, command, payload)
+	}
 	if ms.cb != nil {
 		go ms.cb.OnEvent(timestamp, src, command, payload)
 	}

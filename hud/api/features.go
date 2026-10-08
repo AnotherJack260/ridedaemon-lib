@@ -13,10 +13,9 @@ import (
 // turn-by-turn arrows, dash buttons, notifications, Bluetooth state and the car keyboard. The
 // wire formats live in hud/net/features_*.go, each with its CarbitRide file:line.
 //
-// Wiring, until the session does it itself: create one DashFeatures per MobileSession and feed
-// it every PXC event from MobileCallback.OnEvent:
-//
-//	if (source == 2 /* PXC */) features.handlePxcEvent(time, command, payload)
+// Wiring: create one DashFeatures per MobileSession with NewDashFeatures. The session feeds it
+// every PXC event itself, in the order the dash sent them; the app must NOT call
+// handlePxcEvent as well, or every button and gate would be handled twice.
 //
 // Its senders block until the dash answers, like SendPhoneCommand: call them off the main
 // thread, from one worker so they keep their order. A sender that returns false without an
@@ -103,8 +102,10 @@ func RoundaboutDirection(degrees float64) int {
 	return net.RoundaboutDirection(degrees)
 }
 
-// DashFeatureListener receives what the dash asks of the phone. Every call is made on the
-// goroutine that called HandlePxcEvent.
+// DashFeatureListener receives what the dash asks of the phone. For a DashFeatures from
+// NewDashFeatures the calls come one at a time, in the order the dash sent its commands, from the
+// session's feature worker - never the main thread. A call may block (call a sender, say): only
+// the feature calls after it wait; the session's events and OnEvent do not.
 type DashFeatureListener interface {
 	// OnNaviConfig: 0x10040, the dash's icon count; 19 (the legacy table) until it says.
 	OnNaviConfig(maxNaviIcon int)
@@ -173,15 +174,29 @@ type DashFeatures struct {
 	info          net.FeatureClientInfo
 	lastNavi      time.Time
 	lastSkip      time.Time // last next/prev press that went through
+
+	// The session's PXC events waiting for HandlePxcEvent; see enqueue.
+	queueMu  sync.Mutex
+	queue    []queuedPxcEvent
+	draining bool
 }
 
-// NewDashFeatures binds the features to a session. listener may be nil.
+type queuedPxcEvent struct {
+	timeMs  int64
+	command int
+	payload []byte
+}
+
+// NewDashFeatures binds the features to a session, which from then on feeds them every PXC event
+// itself, in order (see DashFeatureListener). Do not call handlePxcEvent on the result: the
+// session already does. listener may be nil. A second call for the same session replaces the
+// first DashFeatures, which then hears nothing more.
 //
 // ponytail: CarbitRide resets the icon count and the notification gate when the phone channel
 // reconnects (sdk/b0.java:354-367); here they last for the session, since it is the same dash.
 func NewDashFeatures(session *MobileSession, listener DashFeatureListener) *DashFeatures {
 	cfg := session.cfg
-	return &DashFeatures{
+	f := &DashFeatures{
 		send: func(cmd uint32, body []byte) (*PhoneCommandReply, error) {
 			return session.SendPhoneCommand(int64(cmd), body, 0)
 		},
@@ -197,10 +212,16 @@ func NewDashFeatures(session *MobileSession, listener DashFeatureListener) *Dash
 		listener:    listener,
 		maxNaviIcon: net.DefaultMaxNaviIcon,
 	}
+	session.features.Store(f)
+	return f
 }
 
 // HandlePxcEvent reads one PXC event (OnEvent source 2) and reports whether it was one of the
 // dash's feature commands. timeMs is OnEvent's time; the button debounce runs on it.
+//
+// The session calls this itself for a DashFeatures made by NewDashFeatures: the app must not
+// call it too, or each command is handled twice. It is exported for a host that feeds the
+// features some other way.
 func (f *DashFeatures) HandlePxcEvent(timeMs int64, command int, payload []byte) bool {
 	cmd := uint32(command)
 	if cmd == net.PxcHudConf {
@@ -263,6 +284,38 @@ func (f *DashFeatures) HandlePxcEvent(timeMs int64, command int, payload []byte)
 		l.OnGoHome()
 	}
 	return true
+}
+
+// enqueue hands one PXC event to HandlePxcEvent on this DashFeatures' worker: in order, one at a
+// time, and without ever blocking the caller (relayEvent), whatever the listener does. The worker
+// exists only while there is something to handle.
+//
+// ponytail: unbounded queue; a listener that never returns grows it by the dash's traffic (about
+// a heartbeat a second) for the rest of the session. Bound it if that ever matters.
+func (f *DashFeatures) enqueue(timeMs int64, command int, payload []byte) {
+	f.queueMu.Lock()
+	f.queue = append(f.queue, queuedPxcEvent{timeMs, command, payload})
+	start := !f.draining
+	f.draining = true
+	f.queueMu.Unlock()
+	if start {
+		go f.drain()
+	}
+}
+
+func (f *DashFeatures) drain() {
+	for {
+		f.queueMu.Lock()
+		if len(f.queue) == 0 {
+			f.draining = false
+			f.queueMu.Unlock()
+			return
+		}
+		e := f.queue[0]
+		f.queue = f.queue[1:]
+		f.queueMu.Unlock()
+		f.HandlePxcEvent(e.timeMs, e.command, e.payload)
+	}
 }
 
 // skipAllowed is the shared next/prev debounce (sdk/u.java:83-98).

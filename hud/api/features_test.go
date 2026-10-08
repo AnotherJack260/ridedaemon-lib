@@ -3,6 +3,7 @@ package api
 import (
 	"bytes"
 	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	stdnet "net"
 	"strings"
@@ -256,8 +257,8 @@ func awaitEvent(t *testing.T, events chan pxcEvent, source, cmd int) pxcEvent {
 }
 
 // A dash button, end to end through a real session: the C2P registry answers it with the empty
-// cmd+1 and the app still gets it from OnEvent as source PXC with its body, as before the feature
-// handlers were registered.
+// cmd+1, the app still gets it from OnEvent as source PXC with its body, as before the feature
+// handlers were registered, and the session hands it to its DashFeatures without the app.
 func TestFeatureCommandReachesOnEventThroughTheRegistry(t *testing.T) {
 	for _, port := range []string{":10920", ":10921", ":10922"} {
 		ln, err := stdnet.Listen("tcp", port)
@@ -271,6 +272,8 @@ func TestFeatureCommandReachesOnEventThroughTheRegistry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	keys := make(chan [3]int, 1)
+	NewDashFeatures(session, keyListener{keys: keys})
 	hostEnd, deviceEnd := stdnet.Pipe()
 	defer hostEnd.Close()
 	started := make(chan error, 1)
@@ -290,6 +293,14 @@ func TestFeatureCommandReachesOnEventThroughTheRegistry(t *testing.T) {
 	if e := awaitEvent(t, cb.events, int(core.EventSourcePXC), int(net.PxcDashButton)); !bytes.Equal(e.payload, body) {
 		t.Fatalf("OnEvent payload %q, want %q", e.payload, body)
 	}
+	select {
+	case k := <-keys:
+		if k != [3]int{0x1040, 2, KeyActionPlay} {
+			t.Fatalf("OnDashKey%v", k)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("the session never handed the button to its DashFeatures")
+	}
 
 	host.send(0x45545257, 1, ctrl, pxc(net.PxcHeartbeat, nil)) // the dash's first beat completes the start
 	if err := <-started; err != nil {
@@ -299,5 +310,66 @@ func TestFeatureCommandReachesOnEventThroughTheRegistry(t *testing.T) {
 		t.Fatal(err)
 	}
 	for range host.packets {
+	}
+}
+
+// keyListener reports OnDashKey; the first call waits for release when it is set.
+type keyListener struct {
+	noListener
+	keys    chan [3]int
+	release chan struct{}
+}
+
+func (l keyListener) OnDashKey(code, keyType, action int) {
+	if l.release != nil {
+		<-l.release
+	}
+	l.keys <- [3]int{code, keyType, action}
+}
+
+// The session feeds its DashFeatures every PXC event, in the dash's order, on a worker: a
+// listener that blocks holds up neither relayEvent nor OnEvent, and nothing else is fed to it.
+func TestRelayEventFeedsTheFeaturesInOrderWithoutBlocking(t *testing.T) {
+	cb := eventsCallback{make(chan pxcEvent, 64)}
+	session := &MobileSession{cb: cb}
+	release, keys := make(chan struct{}), make(chan [3]int, 8)
+	NewDashFeatures(session, keyListener{keys: keys, release: release})
+
+	codes := []int{0x1040, 0x1043, 0x1047, 0x1080}
+	relayed := make(chan struct{})
+	go func() {
+		for _, code := range codes {
+			session.relayEvent(core.HudEvent{Source: core.EventSourcePXC, Cmd: int(net.PxcDashButton),
+				Data: json.RawMessage(fmt.Sprintf(`{"code":%d,"type":2}`, code))})
+		}
+		// Not PXC: never a feature command, whatever its number.
+		session.relayEvent(core.HudEvent{Source: core.EventSourceMediaControl, Cmd: int(net.PxcDashButton),
+			Data: []byte(`{"code":4161,"type":2}`)})
+		close(relayed)
+	}()
+	select {
+	case <-relayed:
+	case <-time.After(time.Second):
+		t.Fatal("relayEvent blocked behind the feature listener")
+	}
+	for range codes {
+		awaitEvent(t, cb.events, int(core.EventSourcePXC), int(net.PxcDashButton))
+	}
+
+	close(release)
+	for i, code := range codes {
+		select {
+		case k := <-keys:
+			if k[0] != code {
+				t.Fatalf("call %d: OnDashKey(0x%x), want 0x%x", i, k[0], code)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("call %d never came", i)
+		}
+	}
+	select {
+	case k := <-keys:
+		t.Fatalf("a media-control event reached the features: %v", k)
+	case <-time.After(50 * time.Millisecond):
 	}
 }
