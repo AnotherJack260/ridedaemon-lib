@@ -352,6 +352,9 @@ type PXCControl struct {
 	tracker  *ConnTracker
 
 	stopOnce sync.Once
+	// outClosed: Stop closed Events and Errors (see emitError).
+	outMu     sync.Mutex
+	outClosed bool
 
 	Events      chan PXCResponse
 	Errors      chan error
@@ -826,8 +829,9 @@ func (s *PXCControl) releaseConnectionState(conn net.Conn) {
 // it goes the way a dead connection goes: its read loop ends and reports it through connectionError,
 // fatal only when nothing else serves the dash, with cause in place of the socket's complaint.
 func (s *PXCControl) retire(conn net.Conn, cause error) {
-	if !s.connectionState(conn).retired.CompareAndSwap(nil, &cause) {
-		return
+	value, ok := s.connections.Load(conn)
+	if !ok || !value.(*pxcConnectionState).retired.CompareAndSwap(nil, &cause) {
+		return // already retired, or already gone with its read loop
 	}
 	s.phoneMu.Lock()
 	if s.phone == conn {
@@ -846,6 +850,11 @@ func (s *PXCControl) heartbeatEvery() time.Duration {
 }
 
 func (s *PXCControl) emitEvent(evt PXCResponse) {
+	s.outMu.Lock()
+	defer s.outMu.Unlock()
+	if s.outClosed {
+		return
+	}
 	select {
 	case s.Events <- evt:
 	default:
@@ -853,7 +862,16 @@ func (s *PXCControl) emitEvent(evt PXCResponse) {
 	}
 }
 
+// emitError hands err to the host. It, and emitEvent, are safe after Stop has closed the channels:
+// some reporters run off the server's WaitGroup (MCU-Lite's data watchdog, the media control's
+// STREAM_START hooks).
 func (s *PXCControl) emitError(err error) {
+	s.outMu.Lock()
+	defer s.outMu.Unlock()
+	if s.outClosed {
+		logging.Printf("Dropping error from PXC [stopped]: %v", err)
+		return
+	}
 	select {
 	case s.Errors <- err:
 	default:
@@ -1483,12 +1501,17 @@ func (s *PXCControl) Stop(ctx context.Context) error {
 		return ctx.Err()
 	case <-done:
 		logging.Printf("PXC stream closed through done channel")
-		if s.Errors != nil {
-			close(s.Errors)
+		s.outMu.Lock()
+		if !s.outClosed {
+			if s.Errors != nil {
+				close(s.Errors)
+			}
+			if s.Events != nil {
+				close(s.Events)
+			}
+			s.outClosed = true
 		}
-		if s.Events != nil {
-			close(s.Events)
-		}
+		s.outMu.Unlock()
 		return nil
 	}
 }

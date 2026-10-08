@@ -1,6 +1,7 @@
 package net
 
 import (
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -681,5 +682,34 @@ func TestIdleProbeIsOptIn(t *testing.T) {
 			t.Fatalf("idle frame %d = 0x%x, want the heartbeat", i, got.Command)
 		}
 		control.handleEvent(&PXCResponse{Command: PxcHeartbeatOk}, client)
+	}
+}
+
+// Some reporters run off the server's WaitGroup - MCU-Lite's data watchdog, the media control's
+// STREAM_START hooks - and can report after Stop has closed Errors: the error is dropped instead
+// of panicking on the closed channel, and a second Stop does not close it twice.
+func TestAnErrorAfterStopIsDropped(t *testing.T) {
+	control := NewPXCControl(":0", nil, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := control.Stop(ctx); err != nil {
+		t.Fatal(err)
+	}
+	control.emitError(errors.New("reported late"))
+	if err := control.Stop(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// A connection whose read loop has already ended and released it is not brought back by a late
+// retirement - two unanswered release commands on one channel retire it twice.
+func TestRetiringAReleasedConnectionLeavesNoState(t *testing.T) {
+	control := NewPXCControl(":0", nil, nil)
+	client, _ := openPhoneChannel(t, control)
+	control.retire(client, errors.New("first"))
+	control.releaseConnectionState(client) // its read loop ends
+	control.retire(client, errors.New("second"))
+	if _, ok := control.connections.Load(client); ok {
+		t.Fatal("a late retirement recreated the state of a released connection")
 	}
 }
