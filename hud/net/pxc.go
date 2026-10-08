@@ -430,9 +430,8 @@ type PXCControl struct {
 // C2PHandler answers one request the dash sends on PXC (an even command), for a command the
 // switch in handleEvent does not name. It returns the body of the cmd+1 reply - nil for an empty
 // one, which is what CarbitRide answers nearly every command it handles with (v0.d(),
-// sdk/v0.java:50-66). An error is answered 0x80000020 {"errCode":-2147483648,"errMsg":...}, as
-// CarbitRide answers a handler that failed, typically on a body that is not JSON
-// (sdk/b1.java:126-144, om/c.java:24-37).
+// sdk/v0.java:50-66). An error is answered with a header-only 0x80000020 (handlerError), as
+// CarbitRide answers a handler that failed, typically on a body that is not JSON.
 //
 // It runs on the connection's reader goroutine before the reply is written: it must not block.
 // The request already reached the event stream; emitTransport is for a decoded, typed event.
@@ -461,9 +460,18 @@ func c2pHandler(cmd uint32) C2PHandler {
 	return c2pHandlers[cmd]
 }
 
-// pxcCmdError is the errCode CarbitRide puts in 0x80000020 for a handler that threw:
-// C.RATE_UNSET_INT, Integer.MIN_VALUE (km/h.java:30-34).
-const pxcCmdError = -2147483648
+// handlerError is CarbitRide's answer to a C2P handler that failed: 0x80000020 with NO body.
+//
+// When v0.d() returns non-zero, b1.a() calls om.c.a(code, throwable), then om.c.sendCmd()
+// (sdk/b1.java:129-144). om.c.a() builds {"errCode","errMsg"} but stores it with
+// this.mCmdResp.j(...) - the response buffer (om/c.java:23-35) - while z0.sendCmd() writes
+// mCmdBaseReq, the request buffer (sdk_communication/z0.java:85-91). om.c never fills mCmdBaseReq
+// (it has no preRequest()), and i.o() writes a 16-byte header with size 16 for a null body
+// (sdk_communication/i.java:149-163). The cmd+1 is not sent either: v0.d() returns before it
+// writes f78456d (sdk/v0.java:50-66). So the wire carries exactly {0x80000020, 16, 0x80000030, 0}.
+// (A 0x80000020 the phone sends as a request, the RFCOMM bootstrap's failure text, does carry its
+// body: qm/o.java sets it in preRequest(); see transport_rfcomm.go.)
+func handlerError() *PXCResponse { return &PXCResponse{Command: PxcStatusError} }
 
 // emitTransport hands the host one typed transport event; see OnTransport.
 func (s *PXCControl) emitTransport(cmd int, payload []byte) {
@@ -475,17 +483,16 @@ func (s *PXCControl) emitTransport(cmd int, payload []byte) {
 // answerRegistered runs a registered handler and writes its reply on the connection it came in on.
 func (s *PXCControl) answerRegistered(h C2PHandler, event *PXCResponse, conn net.Conn) {
 	s.emitEvent(*event)
-	response := &PXCResponse{Command: event.Command + 1}
 	body, err := h(s, event)
+	response := &PXCResponse{Command: event.Command + 1, Body: body}
 	if err != nil {
 		logging.Printf("PXC 0x%x: %v; answering 0x%x", event.Command, err, PxcStatusError)
-		body, _ = json.Marshal(map[string]any{"errCode": pxcCmdError, "errMsg": err.Error()})
-		response.Command = PxcStatusError
+		response = handlerError()
 	}
-	response.Body = body
 	if err := s.writeResponse(response, conn, nil); err != nil {
 		s.emitError(s.connectionError(conn, PxcWriteErr, err))
-	} else if body != nil {
+	} else if response.Body != nil || response.Command != event.Command+1 {
+		// As for QUERY_TIME: the only way a rider's log shows what the dash was told.
 		s.emitEvent(*response)
 	}
 }

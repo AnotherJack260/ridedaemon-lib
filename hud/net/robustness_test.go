@@ -287,7 +287,7 @@ func TestCarSupportCmdsIsAnsweredLikeTheOfficialApp(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			control := NewPXCControl(":0", nil, nil)
 			got := handlePXCEventAndReadResponses(t, control, &PXCResponse{Command: PxcCarSupportCmds, Body: json.RawMessage(tc.body)}, 1)[0]
-			if got.Command != tc.want || (tc.want != PxcStatusError && len(got.Body) != 0) {
+			if got.Command != tc.want || len(got.Body) != 0 {
 				t.Fatalf("reply = 0x%x %q, want 0x%x", got.Command, got.Body, tc.want)
 			}
 		})

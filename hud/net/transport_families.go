@@ -95,10 +95,6 @@ func answerMCU(event *PXCResponse) *PXCResponse {
 	return &PXCResponse{Command: event.Command + 1}
 }
 
-// handlerError is om/c: 0x80000020 for a handler that failed. Its errCode/errMsg JSON is put on
-// the response object instead of the request (om/c.java:16-27), so the wire carries no body.
-func handlerError() *PXCResponse { return &PXCResponse{Command: PxcStatusError} }
-
 // isJSONObjectOrEmpty is what new JSONObject(body) accepts, an empty body being skipped there.
 func isJSONObjectOrEmpty(body []byte) bool {
 	return len(body) == 0 || decodeLenient(body, &struct{}{}) == nil

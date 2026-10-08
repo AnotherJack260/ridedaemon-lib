@@ -644,7 +644,7 @@ func init() {
 }
 
 // A registered handler answers its command with cmd+1 and its body, and may emit a typed event;
-// one that fails is answered 0x80000020 the way CarbitRide answers a handler that threw.
+// one that fails is answered 0x80000020, header only, the way CarbitRide answers a handler that threw.
 func TestRegisteredC2PHandlersAnswerTheirCommand(t *testing.T) {
 	control := NewPXCControl(":0", nil, nil)
 	var transport []int
@@ -658,13 +658,10 @@ func TestRegisteredC2PHandlersAnswerTheirCommand(t *testing.T) {
 		t.Fatalf("transport events = %v", transport)
 	}
 
+	// Header only: om/c's errCode/errMsg JSON never reaches the wire (see handlerError).
 	got = handlePXCEventAndReadResponses(t, control, &PXCResponse{Command: testC2PBroken, Body: []byte(`x`)}, 1)[0]
-	var body struct {
-		ErrCode int64  `json:"errCode"`
-		ErrMsg  string `json:"errMsg"`
-	}
-	if got.Command != PxcStatusError || json.Unmarshal(got.Body, &body) != nil || body.ErrCode != pxcCmdError || body.ErrMsg == "" {
-		t.Fatalf("failed handler reply = 0x%x %s", got.Command, got.Body)
+	if got.Command != PxcStatusError || got.Size != pxcHeaderSize || len(got.Body) != 0 {
+		t.Fatalf("failed handler reply = 0x%x size %d %q", got.Command, got.Size, got.Body)
 	}
 	assertNoPXCError(t, control)
 }
