@@ -336,6 +336,7 @@ func (s *PXCControl) switchToTLS(conn net.Conn, reply *PXCResponse) bool {
 		}
 		state.writeMu.Lock()
 		defer state.writeMu.Unlock()
+		_ = c.Conn.SetWriteDeadline(time.Now().Add(tlsHandshakeTimeout)) // startTLS clears it
 		if _, err := c.Conn.Write(encodeFrame(reply)); err != nil {
 			return err
 		}

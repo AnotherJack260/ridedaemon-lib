@@ -985,9 +985,11 @@ func (s *PXCControl) writeResponse(res *PXCResponse, conn net.Conn, raw *[]byte)
 	}
 	// Bounded by the dash's own timeout: a dash that stops reading would otherwise hold this lock,
 	// and the phone command queue behind it, for as long as the socket lives. A frame cut short
-	// leaves nothing worth keeping on the socket, so it is retired.
+	// leaves nothing worth keeping on the socket, so it is retired. The bound is this write's
+	// only: the TLS switch writes on the socket too.
 	timeout := s.p2cReplyTimeout()
 	_ = conn.SetWriteDeadline(time.Now().Add(timeout))
+	defer func() { _ = conn.SetWriteDeadline(time.Time{}) }()
 	if _, err := conn.Write(frame); err != nil {
 		if errors.Is(err, os.ErrDeadlineExceeded) {
 			s.retire(conn, fmt.Errorf("the dash took nothing written to it for %s: %w", timeout, err))

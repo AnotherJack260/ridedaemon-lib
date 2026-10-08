@@ -339,3 +339,21 @@ func TestMediaControlFollowsTheSessionTLS(t *testing.T) {
 	default:
 	}
 }
+
+// A dash that asks for TLS a while after the phone last wrote to it still gets its plaintext
+// answer: the bound on one write must not linger on the socket for the next writer.
+func TestStartTLSLongAfterTheLastWrite(t *testing.T) {
+	control := startTLSControl(t, true)
+	control.p2cTimeout.Store(int64(20 * time.Millisecond))
+	ctrl := dialDash(t, control, PxcHandshake)
+	time.Sleep(60 * time.Millisecond)
+	writeDashFrame(t, ctrl, PxcStartTLS, nil)
+	if got := readPXCResponse(t, ctrl); got.Command != PxcStartTLS+1 || string(got.Body) != "\x00\x00\x00\x02" {
+		t.Fatalf("0x107C0 answered 0x%x %x", got.Command, got.Body)
+	}
+	secure := dashTLS(t, ctrl)
+	writeDashFrame(t, secure, PxcHeartbeat, nil)
+	if got := readPXCResponse(t, secure); got.Command != PxcHeartbeatOk {
+		t.Fatalf("heartbeat over TLS answered 0x%x", got.Command)
+	}
+}
