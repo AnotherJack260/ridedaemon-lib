@@ -2,9 +2,11 @@ package net
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math/rand/v2"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -205,10 +207,15 @@ func (m *MCULite) quietClose(c net.Conn) {
 
 // watch ends the MCU-Lite session when one of its PXC channels closes: losing the request
 // channel closes the phone's and losing the phone's closes the request channel and the data
-// (sdk/b1.java:286-297, sdk/x0.java:263-289).
+// (sdk/b1.java:286-297, sdk/x0.java:263-289). One watcher per connection, however often the dash
+// repeats its opening on it.
 func (m *MCULite) watch(s *PXCControl, conn net.Conn, name string) {
 	s.nameChannel(conn, name)
-	done := s.connectionState(conn).done
+	state := s.connectionState(conn)
+	if !state.mcuWatched.CompareAndSwap(false, true) {
+		return
+	}
+	done := state.done
 	s.wg.Add(1)
 	go func() {
 		defer s.wg.Done()
@@ -242,9 +249,10 @@ func (m *MCULite) teardown(from net.Conn, reason error) {
 	}
 }
 
-// claimData takes a data-port connection when an MCU-Lite session is up and the connection comes
-// from its dash: t0.c.run() picks the MCU-Lite data thread when PXCForMCULite's phone channel is
-// alive and the socket is from the request channel's host (common/base/t0.java:258-264).
+// claimData takes a data-port connection for serveData when an MCU-Lite session is up and the
+// connection comes from its dash: t0.c.run() picks the MCU-Lite data thread when PXCForMCULite's
+// phone channel is alive and the socket is from the request channel's host
+// (common/base/t0.java:258-264). The caller serves it, so its shutdown waits for it.
 func (m *MCULite) claimData(conn net.Conn) bool {
 	if m == nil {
 		return false
@@ -260,7 +268,6 @@ func (m *MCULite) claimData(conn net.Conn) bool {
 	if old != nil {
 		_ = old.Close() // one data thread at a time (t0.f0())
 	}
-	go m.serveData(conn)
 	return true
 }
 
@@ -268,7 +275,8 @@ func (m *MCULite) claimData(conn net.Conn) bool {
 // (it replaces the count, it does not add to it). For each credit the phone sends the next frame
 // - a pending GPS frame, else a pending weather frame, else the latest still - and then waits
 // 1000/fps ms. Credits with nothing to send are kept. After a sent frame the GPS (60 s) and
-// weather (4 h) timers are checked. No credit for 15 s ends the MCU-Lite session.
+// weather (4 h) timers are checked. No credit for 15 s ends the MCU-Lite session, and so does a
+// frame the dash takes nothing of for as long.
 func (m *MCULite) serveData(conn net.Conn) {
 	defer func() {
 		_ = conn.Close()
@@ -296,9 +304,19 @@ func (m *MCULite) serveData(conn net.Conn) {
 		timeout = m.watchdog
 	}
 
+	// c0.a: a watchdog of its own, restarted by every credit, so a frame the dash stopped reading
+	// cannot keep it from firing. It closes the data socket, which ends that write, and the
+	// session with it (c0.java:21-40).
+	end := func(reason error) {
+		_ = conn.Close()
+		m.teardown(conn, reason)
+	}
+	watchdog := time.AfterFunc(timeout, func() {
+		end(fmt.Errorf("MCU-Lite: no frame credit from the dash for %s", timeout))
+	})
+	defer watchdog.Stop()
+
 	var credits atomic.Int32
-	var heard atomic.Int64
-	heard.Store(time.Now().UnixNano())
 	wake := make(chan struct{}, 1)
 	closed := make(chan struct{})
 	go func() {
@@ -309,32 +327,32 @@ func (m *MCULite) serveData(conn net.Conn) {
 				return
 			}
 			credits.Store(int32(b[0]))
-			heard.Store(time.Now().UnixNano())
+			watchdog.Reset(timeout)
 			select {
 			case wake <- struct{}{}:
 			default:
 			}
 		}
 	}()
+	defer func() { _ = conn.Close(); <-closed }() // before watchdog.Stop: the reader resets it
 
 	var lastGPS, lastWeather time.Time
 	for {
-		if silent := time.Since(time.Unix(0, heard.Load())); silent >= timeout {
-			m.teardown(conn, fmt.Errorf("MCU-Lite: no frame credit from the dash for %s", silent.Round(time.Second)))
-			return
-		}
 		if credits.Load() <= 0 {
 			select {
 			case <-wake:
 			case <-closed:
 				return
-			case <-time.After(timeout - time.Since(time.Unix(0, heard.Load()))):
 			}
 			continue
 		}
 		frame := m.nextFrame()
 		if frame != nil {
+			_ = conn.SetWriteDeadline(time.Now().Add(timeout))
 			if _, err := conn.Write(frame); err != nil {
+				if errors.Is(err, os.ErrDeadlineExceeded) {
+					end(fmt.Errorf("MCU-Lite: the dash took no frame for %s", timeout))
+				}
 				return
 			}
 			credits.Add(-1)

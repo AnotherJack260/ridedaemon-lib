@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	stdnet "net"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -129,6 +130,15 @@ func newMCULiteDash(t *testing.T) *mcuLiteDash {
 	return d
 }
 
+// serveData hands conn to the MCU-Lite data server, as the media stream's accept loop does.
+func (d *mcuLiteDash) serveData(conn stdnet.Conn) bool {
+	if !d.lite.claimData(conn) {
+		return false
+	}
+	go d.lite.serveData(conn)
+	return true
+}
+
 func (d *mcuLiteDash) open(t *testing.T, channel uint32) stdnet.Conn {
 	t.Helper()
 	car, dash := stdnet.Pipe()
@@ -224,7 +234,7 @@ func TestMCULiteDataChannel(t *testing.T) {
 	car, dash := stdnet.Pipe()
 	t.Cleanup(func() { _ = dash.Close() })
 	_ = dash.SetDeadline(time.Now().Add(3 * time.Second))
-	if !d.lite.claimData(car) {
+	if !d.serveData(car) {
 		t.Fatal("the data socket was not taken")
 	}
 	if _, err := dash.Write([]byte{4}); err != nil {
@@ -277,7 +287,7 @@ func TestMCULiteDataWatchdogEndsTheSession(t *testing.T) {
 	d.lite.watchdog = 50 * time.Millisecond
 	car, dash := stdnet.Pipe()
 	t.Cleanup(func() { _ = dash.Close() })
-	if !d.lite.claimData(car) {
+	if !d.serveData(car) {
 		t.Fatal("the data socket was not taken")
 	}
 	err := readPXCError(t, d.control)
@@ -324,7 +334,7 @@ func TestMCULiteDataSocketRules(t *testing.T) {
 	d := newMCULiteDash(t)
 	car, dash := stdnet.Pipe()
 	defer dash.Close()
-	if !d.lite.claimData(car) {
+	if !d.serveData(car) {
 		t.Fatal("not taken")
 	}
 	_ = dash.SetReadDeadline(time.Now().Add(time.Second))
@@ -426,5 +436,117 @@ func TestCarFamilyBytesAreUnchangedByTheFamilyHook(t *testing.T) {
 		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 		_ = control.Stop(ctx)
 		cancel()
+	}
+}
+
+// A dash that repeats its MCU-Lite opening on the same connection gets it acked each time, and the
+// connection keeps a single watcher instead of one more goroutine per repeat.
+func TestARepeatedMCULiteOpeningKeepsOneWatcher(t *testing.T) {
+	d := newMCULiteDash(t)
+	before := runtime.NumGoroutine()
+	for i := 0; i < 100; i++ {
+		d.ask(t, d.phone, MCULiteChannelP2C, nil, MCULiteChannelP2C+1)
+	}
+	for i := 0; i < 100; i++ { // the first closes the phone channel: a new session (h0.java:369-373)
+		d.ask(t, d.ctrl, MCULiteChannelC2P, nil, MCULiteChannelC2P+1)
+	}
+	if grown := runtime.NumGoroutine() - before; grown > 10 {
+		t.Fatalf("200 repeated openings left %d more goroutines", grown)
+	}
+	_ = d.ctrl.Close()
+	for {
+		if err := readPXCError(t, d.control); strings.Contains(err.Error(), "the dash closed MCU_LITE_C2P") {
+			break
+		}
+	}
+}
+
+// A dash that stops reading the data socket: the frame being written cannot hold the session up.
+// With no credit coming the watchdog closes the socket under the write; with credits still coming
+// the write's own deadline does. Either way the session ends and the data server returns.
+func TestMCULiteStalledFrameWriteEndsTheSession(t *testing.T) {
+	for _, keepCrediting := range []bool{false, true} {
+		d := newMCULiteDash(t)
+		d.ask(t, d.ctrl, MCULiteCmdStartMirror, mustHex(t, goldenMirrorConfig), MCULiteCmdStartMirror+1)
+		d.lite.watchdog = 50 * time.Millisecond
+		d.lite.PushJPEG(bytes.Repeat([]byte{0xFF}, 64))
+		car, dash := stdnet.Pipe()
+		t.Cleanup(func() { _ = dash.Close() })
+		if !d.lite.claimData(car) {
+			t.Fatal("the data socket was not taken")
+		}
+		served := make(chan struct{})
+		go func() { d.lite.serveData(car); close(served) }()
+		if _, err := dash.Write([]byte{4}); err != nil {
+			t.Fatal(err)
+		}
+		if keepCrediting {
+			go func() {
+				for {
+					if _, err := dash.Write([]byte{4}); err != nil {
+						return
+					}
+					time.Sleep(5 * time.Millisecond)
+				}
+			}()
+		}
+		err := readPXCError(t, d.control)
+		if !err.IsFatal() || !strings.Contains(err.Error(), "MCU-Lite") {
+			t.Fatalf("crediting %v: err = %v", keepCrediting, err)
+		}
+		if keepCrediting && !strings.Contains(err.Error(), "took no frame") {
+			t.Fatalf("crediting, the write ended for another reason: %v", err)
+		}
+		select {
+		case <-served:
+		case <-time.After(time.Second):
+			t.Fatalf("crediting %v: the data server is still stuck in its write", keepCrediting)
+		}
+	}
+}
+
+// The video server's Stop closes a data socket it handed to MCU-Lite and waits for it, as it does
+// its own.
+func TestStoppingTheVideoServerEndsTheMCULiteData(t *testing.T) {
+	control := NewPXCControl("127.0.0.1:0", nil, nil)
+	lite := NewMCULite()
+	control.SetMCULite(lite)
+	if err := control.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		defer cancel()
+		_ = control.Stop(ctx)
+	})
+	ctrl := dialDash(t, control, MCULiteChannelC2P)
+	dialDash(t, control, MCULiteChannelP2C)
+	writeDashFrame(t, ctrl, MCULiteCmdStartMirror, mustHex(t, goldenMirrorConfig))
+	readPXCResponse(t, ctrl)
+	lite.PushJPEG([]byte{0xFF, 0xD8, 0xFF, 0xD9})
+	video := NewMediaStream("127.0.0.1:0", nil, 0, 0)
+	video.SetMCULite(lite)
+	if err := video.Start(); err != nil {
+		t.Fatal(err)
+	}
+	dash, err := stdnet.Dial("tcp", video.listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dash.Close()
+	_ = dash.SetDeadline(time.Now().Add(3 * time.Second))
+	if _, err := dash.Write([]byte{1}); err != nil {
+		t.Fatal(err)
+	}
+	if kind, _ := readMCUFrame(t, dash); kind != mcuFrameJPEG {
+		t.Fatalf("frame type %d", kind)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := video.Stop(ctx); err != nil {
+		t.Fatalf("Stop did not wait for the MCU-Lite data: %v", err)
+	}
+	if _, err := dash.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+		t.Fatalf("the MCU-Lite data socket outlived the video server: %v", err)
 	}
 }

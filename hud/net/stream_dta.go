@@ -297,6 +297,14 @@ func (s *MediaStream) acceptLoop() {
 
 		logging.Printf("New MediaStream client from %s", conn.RemoteAddr())
 		if s.mcuLite.claimData(conn) {
+			// Tracked like the others, so Stop closes it and waits for it.
+			s.tracker.Add(conn)
+			s.wg.Add(1)
+			go func() {
+				defer s.wg.Done()
+				defer s.tracker.Remove(conn)
+				s.mcuLite.serveData(conn)
+			}()
 			continue
 		}
 		s.wg.Add(1)

@@ -523,6 +523,8 @@ type pxcConnectionState struct {
 	answered atomic.Bool
 	// dashBeats: the dash keeps this channel alive with heartbeats of its own.
 	dashBeats atomic.Bool
+	// mcuWatched: MCULite.watch has a watcher on this connection.
+	mcuWatched atomic.Bool
 }
 
 func NewPXCControl(port string, kp *KeyPair, config *PhoneConfig) *PXCControl {
