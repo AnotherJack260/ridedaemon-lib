@@ -144,6 +144,11 @@ type MediaStream struct {
 	plainFraming        atomic.Bool
 	// lastPollNanos is the last time the dash asked for a frame, on any connection.
 	lastPollNanos atomic.Int64
+	// How the dash asked for frames in its last CAPTURE_CONFIG and 0x60 (SetCaptureConfig).
+	// The zero values are poll mode, the only mode there was before.
+	wantFps   atomic.Int32
+	movieMode atomic.Bool
+	jpeg      atomic.Bool
 
 	// OnVideoPulls, when set before Start, receives every change worth reporting in
 	// how many frames the dash has pulled on a connection: the socket opening, the
@@ -182,6 +187,15 @@ func (s *MediaStream) NegotiatedExtendedProtocol(extended bool) bool {
 		}
 	}
 	return plain
+}
+
+// SetCaptureConfig tells the stream how the dash wants its frames, for each connection it opens
+// from now on: Carbit picks the mode as a data connection starts (base/q0.java:1244-1274).
+// Movie mode first; then push mode when CAPTURE_CONFIG named a frame rate; else the poll loop.
+func (s *MediaStream) SetCaptureConfig(c CaptureConfig) {
+	s.wantFps.Store(int32(c.WantFps))
+	s.movieMode.Store(c.MovieMode)
+	s.jpeg.Store(c.Encoder == int(mediaEncoderJpeg))
 }
 
 // LastPoll is when the dash last said anything on the video socket; zero if never.
@@ -327,6 +341,14 @@ func (s *MediaStream) handleConn(conn net.Conn) {
 
 	logging.Printf("Starting MediaStream Loop")
 	defer logging.Printf("Stopping MediaStream Loop")
+	if s.movieMode.Load() {
+		s.serveMovieMode(conn, input, output, st, fail)
+		return
+	}
+	if fps := s.wantFps.Load(); fps != 0 {
+		s.servePushMode(conn, input, output, st, fail, fps)
+		return
+	}
 	for {
 		// Read 8 bytes (poll header)
 		if _, err := io.ReadFull(input, header); err != nil {
@@ -368,13 +390,7 @@ func (s *MediaStream) handleConn(conn net.Conn) {
 			continue
 		}
 
-		st.pollCount++
-		if st.pollCount == 1 {
-			logging.Printf("MediaStream: dash pulled its first frame")
-			s.reportPulls(st, VideoPullFirst)
-		} else if time.Since(st.lastPullReport) >= videoPullReportInterval {
-			s.reportPulls(st, VideoPullProgress)
-		}
+		s.countPull(st)
 
 		body, err := s.src.NextFrame(time.Now())
 		if err != nil {
@@ -411,6 +427,162 @@ func (s *MediaStream) handleConn(conn net.Conn) {
 		// Send it chunked, send it paced
 		if err = sendChunked(output, frame, s.chunkSize, s.chunkSleep); err != nil {
 			fail(StrmWriteErr, fmt.Errorf("error sending chunks (idx=%d): %v", idx, err))
+			return
+		}
+	}
+}
+
+// countPull counts one frame the dash asked for (in push and movie mode, where nothing is asked
+// for one frame at a time: one frame written) and reports the first and then a running total.
+func (s *MediaStream) countPull(st *connectionState) {
+	st.pollCount++
+	if st.pollCount == 1 {
+		logging.Printf("MediaStream: dash pulled its first frame")
+		s.reportPulls(st, VideoPullFirst)
+	} else if time.Since(st.lastPullReport) >= videoPullReportInterval {
+		s.reportPulls(st, VideoPullProgress)
+	}
+}
+
+// nextFrame is the poll loop's source read for the other two modes: an error is reported, not
+// fatal, and sent as no frame.
+func (s *MediaStream) nextFrame() []byte {
+	body, err := s.src.NextFrame(time.Now())
+	if err != nil {
+		s.emitError(&StrmError{StrmUnknownCommandErr, fmt.Errorf("error reading frame: %v", err), false})
+		return nil
+	}
+	return body
+}
+
+// writeWhole writes one frame, or 00 00 00 00 when there is none (base/q0.java:609-610), and
+// flushes it whole as Carbit does (q0.java:694-712). The poll loop's chunk pacing stays its own.
+func (s *MediaStream) writeWhole(output *bufio.Writer, st *connectionState, body []byte) error {
+	packet := []byte{0, 0, 0, 0}
+	if len(body) > 0 {
+		packet, _ = buildFramedPacket(body, st.frameCounter, !s.plainFraming.Load())
+		st.frameCounter = (st.frameCounter + 1) & 0x7FFFFFFF
+		s.countPull(st)
+	}
+	if _, err := output.Write(packet); err != nil {
+		return err
+	}
+	return output.Flush()
+}
+
+// readDash reads what the dash sends in the modes that write without waiting for it, so a dash
+// that goes away is noticed and nothing it sends backs up. Each 0x72's body goes to onPoll. The
+// error that ends the reads is sent on failed, and exited closes when it returns.
+func (s *MediaStream) readDash(input *bufio.Reader, onPoll func(body []byte), failed chan<- error, exited chan<- struct{}) {
+	defer close(exited)
+	header := make([]byte, mediaStepFrameSize)
+	for {
+		if _, err := io.ReadFull(input, header); err != nil {
+			failed <- err
+			return
+		}
+		s.lastPollNanos.Store(time.Now().UnixNano())
+		body := make([]byte, max(0, int(int16(binary.LittleEndian.Uint16(header[2:4])))))
+		if _, err := io.ReadFull(input, body); err != nil {
+			failed <- err
+			return
+		}
+		if onPoll != nil && binary.LittleEndian.Uint16(header[0:2]) == 0x0072 {
+			onPoll(body)
+		}
+	}
+}
+
+// servePushMode writes to a dash whose CAPTURE_CONFIG named a frame rate, without waiting to be
+// asked: Carbit starts such a connection without reading a first command (base/q0.java:1250-1252)
+// and loops send-then-pace (q0.java:1076-1078). The pace is the one Carbit computes: a frame every
+// 1000/fps whole milliseconds from the frame's start (nec/m.java:564-567, 424-438). Whatever the
+// dash sends meanwhile is read and ignored; Carbit never reads it at all.
+//
+// ponytail: Carbit 2.4 never stamps that start on this path (o1.f75231b stays 0), so its sleep
+// never fires and frames leave as fast as MediaCodec yields them, each wait capped at 200 ms. A
+// ring buffer cannot block like dequeueOutputBuffer, so this keeps Carbit's computed pace and
+// leaves the app to encode at that same fps (EncoderPlan.Fps).
+func (s *MediaStream) servePushMode(conn net.Conn, input *bufio.Reader, output *bufio.Writer, st *connectionState, fail func(StrmErrorType, error), fps int32) {
+	interval := time.Duration(1000/fps) * time.Millisecond
+	if interval < time.Millisecond {
+		interval = time.Millisecond // ponytail: a dash asking for over 1000 fps, or a negative rate
+	}
+	logging.Printf("MediaStream: dash asked for %d fps, pushing a frame every %v", fps, interval)
+	failed, exited := make(chan error, 1), make(chan struct{})
+	go s.readDash(input, nil, failed, exited)
+	defer func() { _ = conn.Close(); <-exited }()
+
+	for {
+		start := time.Now()
+		if err := s.writeWhole(output, st, s.nextFrame()); err != nil {
+			fail(StrmWriteErr, fmt.Errorf("error pushing frame: %v", err))
+			return
+		}
+		select {
+		case err := <-failed:
+			// The poll loop's sentence for a dash that closed, so both group together downstream.
+			fail(StrmDecodeErr, fmt.Errorf("error reading header: %v", err))
+			return
+		case <-time.After(interval - time.Since(start)):
+		}
+	}
+}
+
+// movieClock stands in for SystemClock.elapsedRealtime() in movie-mode trailers: monotonic
+// milliseconds, only meaningful against each other. ponytail: counted from process start, not boot.
+var movieClock = time.Now()
+
+// serveMovieMode serves a dash in movie mode (supportFunction bit 0 in its 0x60, echoed back;
+// base/l0.java:264-267). It grants frames rather than polling for each: byte 1 of a 0x72's body is
+// how many it will take, replacing what was left, not adding to it (utils/Protocol.java:998-1004,
+// base/q0.java:262-274). The first 0x72 is answered with a frame at once (q0.java:1147-1178), then
+// one frame per credit (q0.java:997-1016). Every H.264 frame carries a u64 LE millisecond
+// timestamp after the payload, counted in its length (q0.java:651-663, 342-347); a JPEG does not
+// (q0.java:515-524), nor does an empty 00 00 00 00.
+func (s *MediaStream) serveMovieMode(conn net.Conn, input *bufio.Reader, output *bufio.Writer, st *connectionState, fail func(StrmErrorType, error)) {
+	logging.Printf("MediaStream: movie mode, sending frames as the dash grants them")
+	var credits atomic.Int32
+	polled := make(chan struct{}, 1)
+	failed, exited := make(chan error, 1), make(chan struct{})
+	go s.readDash(input, func(body []byte) {
+		if len(body) >= 2 {
+			credits.Store(int32(int8(body[1]))) // a Java byte: 0x80 and up grant nothing
+		}
+		select {
+		case polled <- struct{}{}:
+		default:
+		}
+	}, failed, exited)
+	defer func() { _ = conn.Close(); <-exited }()
+
+	waitForPoll := func() bool {
+		select {
+		case <-polled:
+			return true
+		case err := <-failed:
+			fail(StrmDecodeErr, fmt.Errorf("error reading header: %v", err))
+			return false
+		}
+	}
+	if !waitForPoll() {
+		return
+	}
+	for first := true; ; first = false {
+		if !first {
+			for credits.Load() <= 0 {
+				if !waitForPoll() {
+					return
+				}
+			}
+			credits.Add(-1)
+		}
+		body := s.nextFrame()
+		if len(body) > 0 && !s.jpeg.Load() {
+			body = binary.LittleEndian.AppendUint64(append([]byte(nil), body...), uint64(time.Since(movieClock).Milliseconds()))
+		}
+		if err := s.writeWhole(output, st, body); err != nil {
+			fail(StrmWriteErr, fmt.Errorf("error sending movie frame: %v", err))
 			return
 		}
 	}

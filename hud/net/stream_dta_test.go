@@ -3,9 +3,13 @@ package net
 import (
 	"context"
 	"encoding/binary"
+	"encoding/hex"
+	"errors"
 	"io"
 	"net"
+	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -257,5 +261,159 @@ func readPullReport(t *testing.T, reports chan pullReport) pullReport {
 	case <-time.After(2 * time.Second):
 		t.Fatal("no pull report arrived")
 		return pullReport{}
+	}
+}
+
+// queuedFrames hands out its frames in order, then nothing.
+type queuedFrames struct {
+	mu     sync.Mutex
+	frames [][]byte
+}
+
+func (q *queuedFrames) NextFrame(time.Time) ([]byte, error) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if len(q.frames) == 0 {
+		return nil, nil
+	}
+	frame := q.frames[0]
+	q.frames = q.frames[1:]
+	return frame, nil
+}
+
+var videoPoll = []byte{0x72, 0, 0, 0, 0, 0, 0, 0}
+
+func expectNoVideo(t *testing.T, dash net.Conn, wait time.Duration) {
+	t.Helper()
+	_ = dash.SetReadDeadline(time.Now().Add(wait))
+	defer dash.SetReadDeadline(time.Time{})
+	if n, err := dash.Read(make([]byte, 1)); !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("the dash was sent %d byte(s) it did not ask for (err %v)", n, err)
+	}
+}
+
+func readVideo(t *testing.T, dash net.Conn, n int) []byte {
+	t.Helper()
+	_ = dash.SetReadDeadline(time.Now().Add(2 * time.Second))
+	defer dash.SetReadDeadline(time.Time{})
+	b := make([]byte, n)
+	if _, err := io.ReadFull(dash, b); err != nil {
+		t.Fatalf("read %d video bytes: %v", n, err)
+	}
+	return b
+}
+
+// The Zontes 350D (JCDZ21-E42b) polls: wantFps=0, H.264, 1024x464, supportCodec 2, 8 Mbps,
+// supportExtendProtocol=0, on the GENERIC profile, which allows plain framing. Its 0x11 and every
+// byte of its video are pinned here as they were before push and movie mode existed, with
+// carbit-exact media control off and on: nothing before a poll, one frame per poll, idle zeros.
+func TestZontesPollPathIsUnchanged(t *testing.T) {
+	request := make([]byte, 32)
+	binary.LittleEndian.PutUint16(request[0:], 1024)
+	binary.LittleEndian.PutUint16(request[2:], 464)
+	binary.LittleEndian.PutUint32(request[8:], 2)
+	binary.LittleEndian.PutUint32(request[12:], 2)
+	binary.LittleEndian.PutUint32(request[20:], 8388608)
+	idr := []byte{0, 0, 0, 1, 0x09, 0xF0, 0, 0, 0, 1, 0x65, 0x88, 0x84}
+	p := []byte{0, 0, 0, 1, 0x09, 0xF0, 0, 0, 0, 1, 0x41, 0x9A}
+
+	for _, carbit := range []bool{false, true} {
+		control := NewMediaControl(":0")
+		control.CarbitExact = carbit
+		stream := NewMediaStream(":0", &queuedFrames{frames: [][]byte{idr, p}}, 0x1000, 3*time.Millisecond)
+		stream.SetPlainFramingAllowed(true) // GENERIC
+		control.OnCaptureNegotiated = func(extended bool) { stream.NegotiatedExtendedProtocol(extended) }
+		control.OnCaptureConfig = stream.SetCaptureConfig
+
+		rec := &writeRecorder{}
+		control.handleEvent(&MediaCtrlResponse{Command: MediaCtrlInit, Size: 32, Payload: request}, rec)
+		if got := hex.EncodeToString(append(rec.writes[0], rec.writes[1]...)); got != "1100080000000000"+"020000000004d001" {
+			t.Fatalf("carbit=%v: 0x11 = %s", carbit, got)
+		}
+
+		conn, dash := net.Pipe()
+		serveVideoConn(t, stream, conn)
+		expectNoVideo(t, dash, 150*time.Millisecond)
+		var got []byte
+		for _, n := range []int{4 + len(idr), 4 + len(p), 4} {
+			if _, err := dash.Write(videoPoll); err != nil {
+				t.Fatal(err)
+			}
+			got = append(got, readVideo(t, dash, n)...)
+		}
+		want := "0d000000" + "00000001" + "09f0" + "00000001" + "658884" +
+			"0c000000" + "00000001" + "09f0" + "00000001" + "419a" +
+			"00000000"
+		if hex.EncodeToString(got) != want {
+			t.Fatalf("carbit=%v: video\n got %x\nwant %s", carbit, got, want)
+		}
+		_ = dash.Close()
+		_ = conn.Close()
+	}
+}
+
+// A dash that named a frame rate is written to without polling (base/q0.java:1076-1078,
+// 1250-1252), a frame every 1000/fps ms, and idle zeros when there is nothing to send.
+func TestPushModeWritesFramesUnaskedAtTheDashsRate(t *testing.T) {
+	stream := NewMediaStream(":0", &queuedFrames{frames: [][]byte{testAccessUnit, testAccessUnit, testAccessUnit}}, 0x1000, 3*time.Millisecond)
+	stream.SetCaptureConfig(CaptureConfig{WantFps: 50, Encoder: 2}) // 20 ms
+	conn, dash := net.Pipe()
+	defer conn.Close()
+	serveVideoConn(t, stream, conn)
+
+	start := time.Now()
+	for i := 0; i < 3; i++ {
+		frame := readVideo(t, dash, 8+len(testAccessUnit))
+		if binary.LittleEndian.Uint32(frame[0:]) != uint32(4+len(testAccessUnit)) || binary.LittleEndian.Uint32(frame[4:]) != uint32(i) ||
+			string(frame[8:]) != string(testAccessUnit) {
+			t.Fatalf("pushed frame %d = % x", i, frame)
+		}
+	}
+	if idle := readVideo(t, dash, 4); string(idle) != "\x00\x00\x00\x00" {
+		t.Fatalf("idle = % x", idle)
+	}
+	if elapsed := time.Since(start); elapsed < 50*time.Millisecond {
+		t.Fatalf("four writes at 50 fps took %v, want about 60 ms", elapsed)
+	}
+
+	_ = dash.Close()
+	if err := readVideoError(t, stream); !err.IsFatal() {
+		t.Fatalf("the only video channel closed and the session survived it: %v", err)
+	}
+}
+
+// Movie mode: the first 0x72 gets a frame, then one per credit granted in a 0x72's body byte 1
+// (base/q0.java:262-274, 997-1016). H.264 frames carry a u64 timestamp counted in their length
+// (q0.java:651-663); JPEG does not (q0.java:515-524).
+func TestMovieModeSendsAFrameForTheFirstPollThenOnePerCredit(t *testing.T) {
+	for _, tc := range []struct {
+		encoder int
+		trailer int
+	}{{2, 8}, {1, 0}} {
+		frames := [][]byte{testAccessUnit, testAccessUnit, testAccessUnit, testAccessUnit}
+		stream := NewMediaStream(":0", &queuedFrames{frames: frames}, 0x1000, 3*time.Millisecond)
+		stream.SetPlainFramingAllowed(true)
+		stream.NegotiatedExtendedProtocol(false)
+		stream.SetCaptureConfig(CaptureConfig{WantFps: 30, Encoder: tc.encoder, MovieMode: true}) // movie beats push
+		conn, dash := net.Pipe()
+		serveVideoConn(t, stream, conn)
+
+		frame := func() {
+			t.Helper()
+			b := readVideo(t, dash, 4+len(testAccessUnit)+tc.trailer)
+			if binary.LittleEndian.Uint32(b) != uint32(len(testAccessUnit)+tc.trailer) || string(b[4:4+len(testAccessUnit)]) != string(testAccessUnit) {
+				t.Fatalf("encoder %d: movie frame = % x", tc.encoder, b)
+			}
+		}
+		expectNoVideo(t, dash, 100*time.Millisecond)
+		_, _ = dash.Write(videoPoll)
+		frame()
+		expectNoVideo(t, dash, 100*time.Millisecond)
+		_, _ = dash.Write([]byte{0x72, 0, 2, 0, 0, 0, 0, 0, 0, 2}) // two credits
+		frame()
+		frame()
+		expectNoVideo(t, dash, 100*time.Millisecond)
+		_ = dash.Close()
+		_ = conn.Close()
 	}
 }

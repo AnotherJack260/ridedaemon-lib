@@ -2,6 +2,7 @@ package net
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/binary"
 	"encoding/json"
@@ -9,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"sync"
 
 	"github.com/charliecharlieO-o/ridedaemon-go/internal/logging"
@@ -24,13 +26,15 @@ const (
 	MediaCtrlPing       uint16 = 64
 )
 
-// Video codec ids carried in REQ_RV_CONFIG_CAPTURE's wantEncoder and echoed in the reply.
-// The values are EasyConn's own: ECTinyPlus.proto declares
-// VideoCodecType { NONE=0, JEPG=1, H264=2, MP4=3 }, and net.easyconn.carman's mirror sender
-// branches on exactly this field to choose between JPEG stills and an H.264 stream.
+// Video codec ids carried in REQ_RV_CONFIG_CAPTURE's wantEncoder and echoed in the reply, as
+// Carbit Ride 2.4 numbers them (utils/Protocol.java:34-42): JPEG_CODEC=1, H264_CODEC=2,
+// MP4_CODEC=4. 4 is not H.265: it is Carbit's software "MP4" encoder in libJNICodec.so
+// (base/l0.java:615-630), which nothing here can produce. ECTinyPlus.proto's VideoCodecType
+// (MP4=3) is a different enum; the mirror sender branches on Carbit's.
 const (
 	mediaEncoderJpeg uint32 = 1
 	mediaEncoderH264 uint32 = 2
+	mediaEncoderMP4  uint32 = 4
 )
 
 // Command responses
@@ -40,6 +44,109 @@ const (
 	MediaCtrlRcv       uint16 = 113
 	MediaCtrlPong      uint16 = 65
 )
+
+// Commands only carbit-exact media control answers differently (utils/Protocol.java:43-77).
+const (
+	MediaCtrlScreenEvent  uint16 = 32     // REQ_SCREEN_EVENT, the dash's touch
+	MediaCtrlGetVersion   uint16 = 48     // REQ_GET_VERSION
+	MediaCtrlVersion      uint16 = 49     // RLY_GET_VERSION
+	MediaCtrlExecuteShell uint16 = 272    // REQ_EXECUTE_SHELL
+	MediaCtrlShellResult  uint16 = 273    // RLY_EXECUTE_SHELL
+	MediaCtrlUnsupported  uint16 = 0x7F02 // RLY_UN_SUPPORT
+)
+
+// carbitVersion is Carbit's 0x31 body: u32 5002, u32 1 (base/l0.java:475-481).
+var carbitVersion = []byte{0x8A, 0x13, 0, 0, 1, 0, 0, 0}
+
+// CaptureConfig is the dash's REQ_RV_CONFIG_CAPTURE (media cmd 0x10) read at the offsets Carbit
+// reads it (utils/Protocol.java:266-310), plus what this side answered and what the dash's 0x60
+// added. Raw values: no Carbit defaults are applied here (see the host's encoder plan for those).
+type CaptureConfig struct {
+	Width                 int `json:"width"`                 // @0 u16
+	Height                int `json:"height"`                // @2 u16
+	WantFps               int `json:"wantFps"`               // @4 i32; 0 = the dash polls
+	WantEncoder           int `json:"wantEncoder"`           // @8 i32, as sent
+	SupportCodec          int `json:"supportCodec"`          // @12 i32
+	MinQuality            int `json:"minQuality"`            // @16 u16
+	MaxQuality            int `json:"maxQuality"`            // @18 u16, a JPEG's byte budget
+	BitRate               int `json:"bitRate"`               // @20 i32, bps
+	CapScreenMode         int `json:"capScreenMode"`         // @24
+	TouchMode             int `json:"touchMode"`             // @25
+	Orientation           int `json:"orientation"`           // @26: 0 default, 1 land, 2 port, 3/4 round land/port
+	DisplayID             int `json:"displayId"`             // @27
+	VideoType             int `json:"videoType"`             // @28
+	SupportExtendProtocol int `json:"supportExtendProtocol"` // @29
+
+	// What the 0x11 reply said.
+	Encoder       int `json:"encoder"`
+	CaptureWidth  int `json:"captureWidth"`
+	CaptureHeight int `json:"captureHeight"`
+
+	// From the dash's 0x60. MovieMode is in effect only when carbit-exact media control echoed
+	// supportFunction bit 0 back (base/l0.java:264-267); it is never on otherwise.
+	SupportFunction int  `json:"supportFunction"`
+	MovieMode       bool `json:"movieMode"`
+}
+
+func parseCaptureConfig(b []byte) CaptureConfig {
+	u8 := func(at int) int {
+		if len(b) > at {
+			return int(b[at])
+		}
+		return 0
+	}
+	u16 := func(at int) int {
+		if len(b) >= at+2 {
+			return int(binary.LittleEndian.Uint16(b[at:]))
+		}
+		return 0
+	}
+	i32 := func(at int) int {
+		if len(b) >= at+4 {
+			return int(int32(binary.LittleEndian.Uint32(b[at:])))
+		}
+		return 0
+	}
+	return CaptureConfig{
+		Width: u16(0), Height: u16(2), WantFps: i32(4), WantEncoder: i32(8), SupportCodec: i32(12),
+		MinQuality: u16(16), MaxQuality: u16(18), BitRate: i32(20),
+		CapScreenMode: u8(24), TouchMode: u8(25), Orientation: u8(26), DisplayID: u8(27),
+		VideoType: u8(28), SupportExtendProtocol: u8(29),
+	}
+}
+
+// CarbitAlign16 is Carbit's capture-size rounding: to the nearest multiple of 16, a remainder of
+// exactly 8 rounding down (utils/Protocol.java:143-159, then & -16 at :201 and base/l0.java:188).
+func CarbitAlign16(v int) int {
+	if v%16 > 8 {
+		v += 15
+	}
+	return v &^ 15
+}
+
+// CarbitEncoder is the encoder Carbit answers: wantEncoder 0 is read as 1 (utils/Protocol.java:
+// 276-279), then only 1, 2 and 4 are echoed and anything else is answered 0 (base/l0.java:190-198).
+func CarbitEncoder(want int) int {
+	switch uint32(want) {
+	case 0, mediaEncoderJpeg:
+		return int(mediaEncoderJpeg)
+	case mediaEncoderH264, mediaEncoderMP4:
+		return want
+	}
+	return 0
+}
+
+// parseCaptureExtend reads the dash's 0x60 JSON as Carbit does: supportFunction with optInt, and
+// whether viewAreaConfig is an object (utils/Protocol.java:415-440). Unreadable means 0 / absent.
+func parseCaptureExtend(b []byte) (supportFunction int, viewArea bool) {
+	var fields map[string]json.RawMessage
+	if json.Unmarshal(b, &fields) != nil {
+		return 0, false
+	}
+	var sf float64
+	_ = json.Unmarshal(fields["supportFunction"], &sf) // ponytail: optInt also reads "1" strings; no dash sends one
+	return int(sf), bytes.HasPrefix(fields["viewAreaConfig"], []byte("{"))
+}
 
 type MediaCtrlResponse struct {
 	Command uint16
@@ -53,8 +160,8 @@ type ViewConfig struct {
 }
 
 type View struct {
-	ViewAreaConfig  ViewConfig `json:"viewAreaConfig"`
-	SupportFunction int        `json:"supportFunction"`
+	ViewAreaConfig  *ViewConfig `json:"viewAreaConfig,omitempty"`
+	SupportFunction int         `json:"supportFunction"`
 }
 
 type MediaControl struct {
@@ -78,6 +185,25 @@ type MediaControl struct {
 	// OnCaptureNegotiated reports the supportExtendProtocol byte the dash asked for
 	// and we echoed back, once the capture-config reply is on the wire.
 	OnCaptureNegotiated func(extended bool)
+
+	// CarbitExact answers this channel the way Carbit Ride 2.4 does where ridedaemon always
+	// answered otherwise: 0x31 carries {5002, 1}, touch (0x20) gets no reply, 0x110 gets a
+	// shell answer, anything unknown gets 0x7F02 instead of an empty cmd+1, 0x11 uses Carbit's
+	// encoder mapping and size rounding, and 0x61 echoes the dash's own supportFunction (which
+	// can turn on movie mode). Off by default: CFMOTO-lineage dashes were driven for years on
+	// the cmd+1 answers and some touch dashes may count on the 0x21. Set it before Start, for
+	// dashes whose official app is Carbit Ride / EasyConn (flavor 51, e.g. the Zontes 350D).
+	CarbitExact bool
+	// PhoneModel and PhoneOsVersion answer the dash's getprop shell commands (CarbitExact only).
+	PhoneModel     string
+	PhoneOsVersion string
+	// OnCaptureConfig receives every CAPTURE_CONFIG with what it was answered, before the reply
+	// is written (Carbit stores it first too, base/l0.java:235-238), and the same config again
+	// whenever a 0x60 updates it. Called from the connection's goroutine.
+	OnCaptureConfig func(CaptureConfig)
+
+	captureMu sync.Mutex
+	capture   *CaptureConfig
 }
 
 func NewMediaControl(port string) *MediaControl {
@@ -179,15 +305,15 @@ func (s *MediaControl) acceptLoop() {
 	}
 }
 
+// writeResponse writes the 8-byte header in one write and the body in a second, as Carbit does
+// (sdk_communication/b.java:89-112). It used to write the header as three fields, which with
+// TCP_NODELAY (Go's default) can reach a dash as three segments of 2, 2 and 4 bytes.
 func (s *MediaControl) writeResponse(res *MediaCtrlResponse, conn net.Conn) error {
-	// -- write header
-	if err := binary.Write(conn, binary.LittleEndian, res.Command); err != nil {
-		return err
-	}
-	if err := binary.Write(conn, binary.LittleEndian, res.Size); err != nil {
-		return err
-	}
-	if err := binary.Write(conn, binary.LittleEndian, res.Padding); err != nil {
+	header := make([]byte, mediaCtrlHeaderSize)
+	binary.LittleEndian.PutUint16(header[0:2], res.Command)
+	binary.LittleEndian.PutUint16(header[2:4], res.Size)
+	binary.LittleEndian.PutUint32(header[4:8], res.Padding)
+	if _, err := conn.Write(header); err != nil {
 		return err
 	}
 
@@ -204,7 +330,8 @@ func (s *MediaControl) handleEvent(event *MediaCtrlResponse, conn net.Conn) {
 	switch event.Command {
 	case MediaCtrlInit:
 		s.emitEvent(*event)
-		payload := buildMediaCaptureAckPayload(event.Payload, s.JpegStills)
+		payload := buildMediaCaptureAckPayload(event.Payload, s.JpegStills, s.CarbitExact)
+		s.captureNegotiated(event.Payload, payload)
 		response := &MediaCtrlResponse{Command: MediaCtrlAck, Size: uint16(len(payload)), Payload: payload}
 		if err := s.writeResponse(response, conn); err != nil {
 			s.emitError(s.connectionError(conn, CtrlWriteErr, err))
@@ -219,10 +346,20 @@ func (s *MediaControl) handleEvent(event *MediaCtrlResponse, conn net.Conn) {
 		}
 	case MediaCtrlScreenConf:
 		s.emitEvent(*event)
+		supportFunction, viewArea := parseCaptureExtend(event.Payload)
 		viewState := View{
-			ViewAreaConfig:  ViewConfig{State: 0},
+			ViewAreaConfig:  &ViewConfig{State: 0},
 			SupportFunction: s.SupportFunction,
 		}
+		if s.CarbitExact {
+			// Carbit echoes the dash's own value and answers viewAreaConfig only when asked
+			// (base/l0.java:254-266).
+			viewState.SupportFunction = supportFunction
+			if !viewArea {
+				viewState.ViewAreaConfig = nil
+			}
+		}
+		s.extendNegotiated(supportFunction)
 		var payload []byte
 		if p, err := json.Marshal(viewState); err != nil {
 			s.emitError(&CtrlError{CtrlDecodeErr, err, true})
@@ -255,10 +392,77 @@ func (s *MediaControl) handleEvent(event *MediaCtrlResponse, conn net.Conn) {
 		s.emitEvent(*event)
 		// Try to send a default command + 1 empty response
 		response := &MediaCtrlResponse{Command: event.Command + 1, Size: 0}
+		if s.CarbitExact {
+			response = s.carbitReply(event)
+		}
+		if response == nil {
+			break
+		}
 		if err := s.writeResponse(response, conn); err != nil {
 			s.emitError(s.connectionError(conn, CtrlWriteErr, err))
 			break
 		}
+	}
+}
+
+// carbitReply is Carbit's answer to a command ridedaemon otherwise acks with an empty cmd+1
+// (base/l0.java:465-498), or nil where Carbit answers nothing.
+func (s *MediaControl) carbitReply(event *MediaCtrlResponse) *MediaCtrlResponse {
+	var command uint16
+	var body []byte
+	switch event.Command {
+	case MediaCtrlScreenEvent:
+		return nil // injected as touch, never answered (base/l0.java:471-473)
+	case MediaCtrlGetVersion:
+		command, body = MediaCtrlVersion, carbitVersion
+	case MediaCtrlExecuteShell:
+		// Two getprops it knows, "OK" for the rest, NUL-terminated; the "release" it gives is
+		// the SDK level (base/l0.java:275-291).
+		answer := "OK"
+		switch cmd := string(event.Payload); {
+		case strings.EqualFold(cmd, "getprop ro.build.version.release"):
+			answer = s.PhoneOsVersion
+		case strings.EqualFold(cmd, "getprop ro.product.model"):
+			answer = s.PhoneModel
+		}
+		command, body = MediaCtrlShellResult, append([]byte(answer), 0)
+	default:
+		command = MediaCtrlUnsupported // empty RLY_UN_SUPPORT (base/l0.java:496)
+	}
+	return &MediaCtrlResponse{Command: command, Size: uint16(len(body)), Payload: body}
+}
+
+// captureNegotiated records a CAPTURE_CONFIG with what it is being answered and tells the host. A
+// new one turns movie mode off until a 0x60 turns it on again (base/l0.java:136-138).
+func (s *MediaControl) captureNegotiated(request, reply []byte) {
+	c := parseCaptureConfig(request)
+	c.Encoder = int(binary.LittleEndian.Uint32(reply[0:4]))
+	c.CaptureWidth = int(binary.LittleEndian.Uint16(reply[4:6]))
+	c.CaptureHeight = int(binary.LittleEndian.Uint16(reply[6:8]))
+	s.captureMu.Lock()
+	s.capture = &c
+	s.captureMu.Unlock()
+	if s.OnCaptureConfig != nil {
+		s.OnCaptureConfig(c)
+	}
+}
+
+// extendNegotiated adds a 0x60's supportFunction to the current CAPTURE_CONFIG. Movie mode
+// follows bit 0 only where it is echoed back (base/l0.java:264-267). Before any CAPTURE_CONFIG
+// there is nothing to update, and the next one would clear it anyway.
+func (s *MediaControl) extendNegotiated(supportFunction int) {
+	s.captureMu.Lock()
+	if s.capture == nil {
+		s.captureMu.Unlock()
+		return
+	}
+	c := *s.capture
+	c.SupportFunction = supportFunction
+	c.MovieMode = s.CarbitExact && supportFunction&1 == 1
+	s.capture = &c
+	s.captureMu.Unlock()
+	if s.OnCaptureConfig != nil {
+		s.OnCaptureConfig(c)
 	}
 }
 
@@ -270,24 +474,34 @@ func (s *MediaControl) handleEvent(event *MediaCtrlResponse, conn net.Conn) {
 // is the whole experiment: the official app dispatches its mirror sender on this field, and
 // a dash that asks for H.264 while painting none of the H.264 it pulls is the one case where
 // offering it the other format is worth a rider's session. Everything else keeps the echo.
-func buildMediaCaptureAckPayload(request []byte, forceJpeg bool) []byte {
+//
+// carbitExact answers the encoder and size the way Carbit does (CarbitEncoder, CarbitAlign16)
+// instead of echoing any non-zero encoder, turning 0 into H.264 and flooring the size to 16.
+func buildMediaCaptureAckPayload(request []byte, forceJpeg, carbitExact bool) []byte {
 	encoder := mediaEncoderH264
 	width := uint16(800)
 	height := uint16(384)
 	extendedProtocol := byte(1)
 
+	align := func(v uint16) uint16 { return v &^ 0x0f }
+	if carbitExact {
+		align = func(v uint16) uint16 { return uint16(CarbitAlign16(int(v))) }
+	}
 	if len(request) >= 4 {
 		requestedWidth := binary.LittleEndian.Uint16(request[0:2])
 		requestedHeight := binary.LittleEndian.Uint16(request[2:4])
-		if aligned := requestedWidth &^ 0x0f; aligned >= 16 {
+		if aligned := align(requestedWidth); aligned >= 16 {
 			width = aligned
 		}
-		if aligned := requestedHeight &^ 0x0f; aligned >= 16 {
+		if aligned := align(requestedHeight); aligned >= 16 {
 			height = aligned
 		}
 	}
 	if len(request) >= 12 {
-		if requestedEncoder := binary.LittleEndian.Uint32(request[8:12]); requestedEncoder != 0 {
+		requestedEncoder := binary.LittleEndian.Uint32(request[8:12])
+		if carbitExact {
+			encoder = uint32(CarbitEncoder(int(int32(requestedEncoder))))
+		} else if requestedEncoder != 0 {
 			encoder = requestedEncoder
 		}
 	}

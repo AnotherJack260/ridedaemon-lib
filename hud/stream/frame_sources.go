@@ -21,6 +21,7 @@ type LiveSource interface {
 	IsActive(now time.Time) bool
 	PushFrame(au []byte)
 	PrepareForConsumer()
+	SetOpaquePayloads(enabled bool)
 }
 
 var streamHeader = []byte{
@@ -625,5 +626,13 @@ func (m *MuxSource) StopAllFrames() {
 func (m *MuxSource) PrepareLiveConsumer() {
 	if m.Live != nil {
 		m.Live.PrepareForConsumer()
+	}
+}
+
+// SetLiveOpaque switches the live queue between H.264 access units and whole JPEG stills, for a
+// dash that negotiated JPEG mid-session rather than through the host's JpegStills experiment.
+func (m *MuxSource) SetLiveOpaque(enabled bool) {
+	if m.Live != nil {
+		m.Live.SetOpaquePayloads(enabled)
 	}
 }

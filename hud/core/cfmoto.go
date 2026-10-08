@@ -114,6 +114,7 @@ type CfmotoHUD struct {
 	timeZoneOffsetSet     bool
 	skipDashClockSync     bool
 	dashAsksForTime       bool
+	video                 videoPlane
 
 	// What the host said about the phone; see SetPhoneIdentity.
 	identityKey         *net.KeyPair
@@ -655,6 +656,7 @@ func (hud *CfmotoHUD) startStream(ctx context.Context, initConn stdnet.Conn) (er
 	// -- maybe we could change chunkStep to something smaller to reduce latency?
 	mediaStream := net.NewMediaStream(":10920", hud.muxSource, 0x1000, 3*time.Millisecond)
 	mediaStream.SetPlainFramingAllowed(hud.plainVideoFraming)
+	hud.wireVideo(mediaControl, mediaStream)
 	pxcServer.HeardElsewhere = mediaStream.LastPoll
 	mediaStream.OnVideoPulls = func(phase net.VideoPullPhase, pulls uint64) {
 		payload := make([]byte, 9)

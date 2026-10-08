@@ -18,7 +18,7 @@ func TestMediaCaptureAckUsesRequestedCFDL26Dimensions(t *testing.T) {
 	binary.LittleEndian.PutUint32(request[8:12], 2)
 	request[29] = 0
 
-	assertMediaCaptureAck(t, buildMediaCaptureAckPayload(request, false), 2, 720, 704, 0)
+	assertMediaCaptureAck(t, buildMediaCaptureAckPayload(request, false, false), 2, 720, 704, 0)
 }
 
 func TestMediaCaptureAckPreservesLegacyNegotiation(t *testing.T) {
@@ -28,11 +28,11 @@ func TestMediaCaptureAckPreservesLegacyNegotiation(t *testing.T) {
 	binary.LittleEndian.PutUint32(request[8:12], 2)
 	request[29] = 1
 
-	assertMediaCaptureAck(t, buildMediaCaptureAckPayload(request, false), 2, 800, 384, 1)
+	assertMediaCaptureAck(t, buildMediaCaptureAckPayload(request, false, false), 2, 800, 384, 1)
 }
 
 func TestMediaCaptureAckFallsBackForMissingPayload(t *testing.T) {
-	assertMediaCaptureAck(t, buildMediaCaptureAckPayload(nil, false), 2, 800, 384, 1)
+	assertMediaCaptureAck(t, buildMediaCaptureAckPayload(nil, false, false), 2, 800, 384, 1)
 }
 
 // The QJ 5-inch dash's exact request: 800x352, wantEncoder=2 (H264), plain framing. With the
@@ -46,7 +46,7 @@ func TestMediaCaptureAckOffersJpegWhenTheExperimentIsOn(t *testing.T) {
 	binary.LittleEndian.PutUint32(request[8:12], 2)
 	request[29] = 0
 
-	assertMediaCaptureAck(t, buildMediaCaptureAckPayload(request, true), 1, 800, 352, 0)
+	assertMediaCaptureAck(t, buildMediaCaptureAckPayload(request, true, false), 1, 800, 352, 0)
 }
 
 // The experiment must never reach a dashboard that did not ask for it: the same request with
@@ -59,7 +59,7 @@ func TestMediaCaptureAckKeepsH264WhenTheExperimentIsOff(t *testing.T) {
 	binary.LittleEndian.PutUint32(request[8:12], 2)
 	request[29] = 0
 
-	assertMediaCaptureAck(t, buildMediaCaptureAckPayload(request, false), 2, 800, 352, 0)
+	assertMediaCaptureAck(t, buildMediaCaptureAckPayload(request, false, false), 2, 800, 352, 0)
 }
 
 func TestMediaStartPreparesConsumerBeforeAcknowledgement(t *testing.T) {
@@ -165,7 +165,7 @@ func TestMediaCaptureAckOmitsTheFramingByteWhenTheDashDeclaresNone(t *testing.T)
 	binary.LittleEndian.PutUint32(request[8:12], 2)
 	request[29] = 0
 
-	payload := buildMediaCaptureAckPayload(request, false)
+	payload := buildMediaCaptureAckPayload(request, false, false)
 	if len(payload) != 8 {
 		t.Fatalf("payload length = %d, want 8", len(payload))
 	}
@@ -315,5 +315,177 @@ func readMediaControlError(t *testing.T, control *MediaControl) FatalError {
 	case <-time.After(time.Second):
 		t.Fatal("no media control error arrived")
 		return nil
+	}
+}
+
+// writeRecorder keeps every Write as its own slice, so a test can see how a reply was cut up.
+type writeRecorder struct {
+	net.Conn
+	writes [][]byte
+}
+
+func (w *writeRecorder) Write(b []byte) (int, error) {
+	w.writes = append(w.writes, append([]byte(nil), b...))
+	return len(b), nil
+}
+
+func TestCaptureConfigIsReadAtCarbitsOffsets(t *testing.T) {
+	request := make([]byte, 204)
+	binary.LittleEndian.PutUint16(request[0:], 1024)
+	binary.LittleEndian.PutUint16(request[2:], 464)
+	binary.LittleEndian.PutUint32(request[4:], 25)
+	binary.LittleEndian.PutUint32(request[8:], 2)
+	binary.LittleEndian.PutUint32(request[12:], 3)
+	binary.LittleEndian.PutUint16(request[16:], 10)
+	binary.LittleEndian.PutUint16(request[18:], 30000)
+	binary.LittleEndian.PutUint32(request[20:], 8388608)
+	copy(request[24:30], []byte{8, 1, 2, 0, 5, 1})
+
+	want := CaptureConfig{
+		Width: 1024, Height: 464, WantFps: 25, WantEncoder: 2, SupportCodec: 3,
+		MinQuality: 10, MaxQuality: 30000, BitRate: 8388608,
+		CapScreenMode: 8, TouchMode: 1, Orientation: 2, DisplayID: 0, VideoType: 5, SupportExtendProtocol: 1,
+	}
+	if got := parseCaptureConfig(request); got != want {
+		t.Fatalf("parsed %+v\nwant   %+v", got, want)
+	}
+	if got := parseCaptureConfig(request[:4]); got.Width != 1024 || got.WantFps != 0 || got.Orientation != 0 {
+		t.Fatalf("a short request invented fields: %+v", got)
+	}
+}
+
+// Carbit's 0x11: wantEncoder 0 is JPEG, only 1/2/4 are echoed, and the size goes to the nearest
+// 16 (a remainder of exactly 8 rounds down). The default path keeps its own answers.
+func TestCarbitExactCaptureAckUsesCarbitsEncoderAndRounding(t *testing.T) {
+	for _, tc := range []struct {
+		wantEncoder, width, height uint32
+		carbit                     bool
+		encoder                    uint32
+		replyW, replyH             uint16
+	}{
+		{0, 800, 480, true, 1, 800, 480},
+		{1, 800, 480, true, 1, 800, 480},
+		{2, 1024, 464, true, 2, 1024, 464},
+		{3, 800, 480, true, 0, 800, 480},
+		{4, 800, 480, true, 4, 800, 480},
+		{5, 800, 480, true, 0, 800, 480},
+		{2, 730, 712, true, 2, 736, 704},
+		{2, 473, 465, true, 2, 480, 464},
+		{0, 800, 480, false, 2, 800, 480},
+		{3, 800, 480, false, 3, 800, 480},
+		{2, 730, 473, false, 2, 720, 464},
+	} {
+		request := make([]byte, 32)
+		binary.LittleEndian.PutUint16(request[0:], uint16(tc.width))
+		binary.LittleEndian.PutUint16(request[2:], uint16(tc.height))
+		binary.LittleEndian.PutUint32(request[8:], tc.wantEncoder)
+		assertMediaCaptureAck(t, buildMediaCaptureAckPayload(request, false, tc.carbit), tc.encoder, tc.replyW, tc.replyH, 0)
+	}
+}
+
+// The #9 replies, both ways. Every reply is one 8-byte header write, then the body in one write
+// (sdk_communication/b.java:89-112).
+func TestMediaControlRepliesWithAndWithoutCarbitExact(t *testing.T) {
+	hdr := func(cmd, size uint16) []byte {
+		b := make([]byte, 8)
+		binary.LittleEndian.PutUint16(b[0:], cmd)
+		binary.LittleEndian.PutUint16(b[2:], size)
+		return b
+	}
+	touch := []byte{2, 0, 100, 0, 50, 0, 0, 0, 0, 0}
+	for _, tc := range []struct {
+		name    string
+		carbit  bool
+		command uint16
+		payload []byte
+		want    [][]byte // each write; none = no reply
+	}{
+		{"default version", false, MediaCtrlGetVersion, nil, [][]byte{hdr(49, 0)}},
+		{"default touch", false, MediaCtrlScreenEvent, touch, [][]byte{hdr(33, 0)}},
+		{"default unknown", false, 0x99, nil, [][]byte{hdr(0x9A, 0)}},
+		{"default shell", false, MediaCtrlExecuteShell, []byte("ls"), [][]byte{hdr(273, 0)}},
+		{"carbit version", true, MediaCtrlGetVersion, nil, [][]byte{hdr(49, 8), {0x8A, 0x13, 0, 0, 1, 0, 0, 0}}},
+		{"carbit touch", true, MediaCtrlScreenEvent, touch, nil},
+		{"carbit unknown", true, 0x99, nil, [][]byte{hdr(0x7F02, 0)}},
+		{"carbit model", true, MediaCtrlExecuteShell, []byte("getprop ro.product.model"), [][]byte{hdr(273, 9), []byte("Pixel 6a\x00")}},
+		{"carbit release", true, MediaCtrlExecuteShell, []byte("GETPROP ro.build.version.release"), [][]byte{hdr(273, 3), []byte("36\x00")}},
+		{"carbit other shell", true, MediaCtrlExecuteShell, []byte("ls"), [][]byte{hdr(273, 3), []byte("OK\x00")}},
+		{"carbit ping", true, MediaCtrlPing, nil, [][]byte{hdr(65, 0)}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			control := NewMediaControl(":0")
+			control.CarbitExact = tc.carbit
+			control.PhoneModel, control.PhoneOsVersion = "Pixel 6a", "36"
+			conn := &writeRecorder{}
+			control.handleEvent(&MediaCtrlResponse{Command: tc.command, Size: uint16(len(tc.payload)), Payload: tc.payload}, conn)
+			if len(conn.writes) != len(tc.want) {
+				t.Fatalf("writes = % x, want % x", conn.writes, tc.want)
+			}
+			for i := range tc.want {
+				if string(conn.writes[i]) != string(tc.want[i]) {
+					t.Fatalf("write %d = % x, want % x", i, conn.writes[i], tc.want[i])
+				}
+			}
+		})
+	}
+}
+
+// Carbit's 0x61 echoes the dash's supportFunction and carries viewAreaConfig only when asked, and
+// bit 0 is movie mode. The default reply keeps the profile's value, and never turns movie mode on.
+func TestScreenConfigEchoAndMovieMode(t *testing.T) {
+	for _, tc := range []struct {
+		carbit bool
+		ask    string
+		reply  string
+		movie  bool
+	}{
+		{true, `{"supportFunction":1}`, `{"supportFunction":1}`, true},
+		{true, `{"supportFunction":2,"viewAreaConfig":{"initArea":0}}`, `{"viewAreaConfig":{"state":0},"supportFunction":2}`, false},
+		{true, `not json`, `{"supportFunction":0}`, false},
+		{false, `{"supportFunction":1}`, `{"viewAreaConfig":{"state":0},"supportFunction":128}`, false},
+	} {
+		control := NewMediaControl(":0")
+		control.CarbitExact = tc.carbit
+		control.SupportFunction = 128
+		var last CaptureConfig
+		control.OnCaptureConfig = func(c CaptureConfig) { last = c }
+		conn := &writeRecorder{}
+		control.handleEvent(&MediaCtrlResponse{Command: MediaCtrlInit, Payload: make([]byte, 32)}, conn)
+		control.handleEvent(&MediaCtrlResponse{Command: MediaCtrlScreenConf, Payload: []byte(tc.ask)}, conn)
+
+		if got := string(conn.writes[len(conn.writes)-1]); got != tc.reply {
+			t.Errorf("carbit=%v %s: reply %s, want %s", tc.carbit, tc.ask, got, tc.reply)
+		}
+		if last.MovieMode != tc.movie {
+			t.Errorf("carbit=%v %s: movie mode %v, want %v", tc.carbit, tc.ask, last.MovieMode, tc.movie)
+		}
+	}
+}
+
+// A new CAPTURE_CONFIG turns movie mode off (base/l0.java:136-138), and the host hears of it
+// before the reply is on the wire, so a dash that opens 10920 at once is served in the right mode.
+func TestCaptureConfigReachesTheHostBeforeTheReplyAndResetsMovieMode(t *testing.T) {
+	control := NewMediaControl(":0")
+	control.CarbitExact = true
+	conn := &writeRecorder{}
+	var last CaptureConfig
+	control.OnCaptureConfig = func(c CaptureConfig) {
+		if last == (CaptureConfig{}) && len(conn.writes) != 0 {
+			t.Fatal("the capture config reached the host after its reply was written")
+		}
+		last = c
+	}
+	request := make([]byte, 32)
+	binary.LittleEndian.PutUint16(request[0:], 1024)
+	binary.LittleEndian.PutUint16(request[2:], 464)
+	binary.LittleEndian.PutUint32(request[8:], 2)
+	control.handleEvent(&MediaCtrlResponse{Command: MediaCtrlInit, Payload: request}, conn)
+	control.handleEvent(&MediaCtrlResponse{Command: MediaCtrlScreenConf, Payload: []byte(`{"supportFunction":1}`)}, conn)
+	if !last.MovieMode {
+		t.Fatal("0x60 bit 0 did not turn movie mode on")
+	}
+	control.handleEvent(&MediaCtrlResponse{Command: MediaCtrlInit, Payload: request}, conn)
+	if last.MovieMode || last.Encoder != 2 || last.CaptureWidth != 1024 || last.CaptureHeight != 464 {
+		t.Fatalf("after a new CAPTURE_CONFIG: %+v", last)
 	}
 }
