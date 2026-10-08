@@ -428,7 +428,7 @@ func (s *MediaStream) handleConn(conn net.Conn) {
 		}
 
 		// Legacy pacing - 4B len + 4B idx + body
-		frame, idx := buildFramedPacket(body, st.frameCounter, !s.plainFraming.Load())
+		frame, idx := buildFramedPacket(body, st.frameCounter, s.indexed())
 		st.frameCounter = (st.frameCounter + 1) & 0x7FFFFFFF
 
 		// Send it chunked, send it paced
@@ -437,6 +437,14 @@ func (s *MediaStream) handleConn(conn net.Conn) {
 			return
 		}
 	}
+}
+
+// indexed reports whether a frame carries the 4-byte index. A JPEG never does, nor does a movie-mode
+// frame, whatever the dash said about the extend protocol: Carbit writes length | JPEG
+// (base/q0.java:512-525) and, in movie mode, length | AU | timestamp (q0.java:641-651). Only an
+// H.264 frame outside movie mode keeps the format the host and the dash negotiated.
+func (s *MediaStream) indexed() bool {
+	return !s.plainFraming.Load() && !s.jpeg.Load() && !s.movieMode.Load()
 }
 
 // countPull counts one frame the dash asked for (in push and movie mode, where nothing is asked
@@ -467,7 +475,7 @@ func (s *MediaStream) nextFrame() []byte {
 func (s *MediaStream) writeWhole(output *bufio.Writer, st *connectionState, body []byte) error {
 	packet := []byte{0, 0, 0, 0}
 	if len(body) > 0 {
-		packet, _ = buildFramedPacket(body, st.frameCounter, !s.plainFraming.Load())
+		packet, _ = buildFramedPacket(body, st.frameCounter, s.indexed())
 		st.frameCounter = (st.frameCounter + 1) & 0x7FFFFFFF
 		s.countPull(st)
 	}

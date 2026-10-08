@@ -385,15 +385,21 @@ func TestPushModeWritesFramesUnaskedAtTheDashsRate(t *testing.T) {
 // Movie mode: the first 0x72 gets a frame, then one per credit granted in a 0x72's body byte 1
 // (base/q0.java:262-274, 997-1016). H.264 frames carry a u64 timestamp counted in their length
 // (q0.java:651-663); JPEG does not (q0.java:515-524).
+//
+// Neither carries the frame index, under the default framing or with the extend protocol on: the
+// length is followed straight by the picture.
 func TestMovieModeSendsAFrameForTheFirstPollThenOnePerCredit(t *testing.T) {
 	for _, tc := range []struct {
-		encoder int
-		trailer int
-	}{{2, 8}, {1, 0}} {
+		encoder  int
+		trailer  int
+		extended bool
+	}{{2, 8, false}, {1, 0, false}, {2, 8, true}, {1, 0, true}} {
 		frames := [][]byte{testAccessUnit, testAccessUnit, testAccessUnit, testAccessUnit}
 		stream := NewMediaStream(":0", &queuedFrames{frames: frames}, 0x1000, 3*time.Millisecond)
-		stream.SetPlainFramingAllowed(true)
-		stream.NegotiatedExtendedProtocol(false)
+		if tc.extended {
+			stream.SetPlainFramingAllowed(true)
+			stream.NegotiatedExtendedProtocol(true)
+		}
 		stream.SetCaptureConfig(CaptureConfig{WantFps: 30, Encoder: tc.encoder, MovieMode: true}) // movie beats push
 		conn, dash := net.Pipe()
 		serveVideoConn(t, stream, conn)
@@ -415,5 +421,45 @@ func TestMovieModeSendsAFrameForTheFirstPollThenOnePerCredit(t *testing.T) {
 		expectNoVideo(t, dash, 100*time.Millisecond)
 		_ = dash.Close()
 		_ = conn.Close()
+	}
+}
+
+// A JPEG is length | JPEG in every mode (base/q0.java:512-525): no frame index under the default
+// framing nor with the extend protocol on, polled or pushed.
+func TestJPEGFramesCarryNoIndex(t *testing.T) {
+	still := []byte{0xFF, 0xD8, 0xFF, 0xE0, 1, 2, 3, 0xFF, 0xD9}
+	for _, tc := range []struct {
+		name     string
+		wantFps  int
+		extended bool
+	}{
+		{"polled, default framing", 0, false},
+		{"polled, extend protocol", 0, true},
+		{"pushed, default framing", 50, false},
+		{"pushed, extend protocol", 50, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stream := NewMediaStream(":0", &queuedFrames{frames: [][]byte{still, still}}, 0x1000, 3*time.Millisecond)
+			if tc.extended {
+				stream.SetPlainFramingAllowed(true)
+				stream.NegotiatedExtendedProtocol(true)
+			}
+			stream.SetCaptureConfig(CaptureConfig{WantFps: tc.wantFps, Encoder: 1})
+			conn, dash := net.Pipe()
+			defer conn.Close()
+			defer dash.Close()
+			serveVideoConn(t, stream, conn)
+			for i := 0; i < 2; i++ {
+				if tc.wantFps == 0 {
+					if _, err := dash.Write(videoPoll); err != nil {
+						t.Fatal(err)
+					}
+				}
+				frame := readVideo(t, dash, 4+len(still))
+				if binary.LittleEndian.Uint32(frame) != uint32(len(still)) || string(frame[4:]) != string(still) {
+					t.Fatalf("frame %d = % x", i, frame)
+				}
+			}
+		})
 	}
 }
