@@ -208,3 +208,66 @@ func TestAVideoPollBodyIsDrained(t *testing.T) {
 	default:
 	}
 }
+
+// The questions the official app answers with a fixed body (pxcCannedReplies), and the
+// commands it answers with an empty cmd+1, which this answers the same way.
+func TestRepliesMatchTheOfficialApp(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		cmd      uint32
+		body     string
+		wantBody string
+	}{
+		{"CHECK_NETWORK", 0x10410, "", `{"status":false}`},
+		{"QUERY_GPS", 0x10430, "", `{"status":false}`},
+		{"CHECK_APP_NETWORKING_CAPABILITY", 0x10750, "", `{"status":0}`},
+		{"text to show", 0x104E0, `{"text":"hi","level":1}`, `{}`},
+		// km/k0.java: the dash reports its FTP speeds and is answered with an empty ack.
+		{"QUERY_SPEED", PxcSpeedConf, `{"usbSpeed":0,"wifiSpeed":2}`, ""},
+		{"OTA FTP info", PxcOtaFtpInfo, `{"port":11021}`, ""},
+		{"buttons", 0x10350, `{"code":4160,"type":2}`, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			control := NewPXCControl(":0", nil, nil)
+			got := handlePXCEventAndReadResponses(t, control, &PXCResponse{Command: tc.cmd, Body: json.RawMessage(tc.body)}, 1)[0]
+			if got.Command != tc.cmd+1 || string(got.Body) != tc.wantBody {
+				t.Fatalf("reply = 0x%x %q, want 0x%x %q", got.Command, got.Body, tc.cmd+1, tc.wantBody)
+			}
+			assertNoPXCError(t, control)
+		})
+	}
+}
+
+// Everything the owner's Zontes 350D (JCDZ21-E42b, flavor 51, channel 21321) sends on PXC,
+// answered the way the official app answers it. 0x10 and 0x70 go to the media control port
+// and are covered by its own tests.
+func TestEveryZontesCommandIsAnsweredLikeTheOfficialApp(t *testing.T) {
+	control := newHandshakeControl(t)
+	control.phoneChannelWait = 10 * time.Millisecond
+	for _, tc := range []struct {
+		name  string
+		cmd   uint32
+		body  string
+		reply uint32
+		json  bool
+	}{
+		{"handshake (sdk/h0.java:104-117)", PxcHandshake, "", PxcHandshakeOk, false},
+		{"phone channel (sdk/h0.java:104-117)", PxcChannelCarData, "", PxcChannelCarData + 1, false},
+		{"CLIENT_INFO (ECP_C2P_CLIENT_INFO.java:1007-1058)", PxcHudConf,
+			`{"HUID":"h","HUName":"JCDZ21-E42b","flavor":51,"channel":"21321","pxcVersion":"1.0.1"}`, PxcPhoneConf, true},
+		{"QUERY_SPEED (km/k0.java)", PxcSpeedConf, `{"usbSpeed":0,"wifiSpeed":0}`, PxcSpeedOk, false},
+		{"QUERY_TIME (km/n0.java)", PxcQueryTime, "", PxcQueryTimeAck, true},
+		{"CHECK_SN (km/m.java)", PxcClientSet, `{"client_set":"easy_conn","sn":"S"}`, PxcCheckSnAck, false},
+		{"heartbeat (om/d.java)", PxcHeartbeat, "", PxcHeartbeatOk, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := handlePXCEventAndReadResponses(t, control, &PXCResponse{Command: tc.cmd, Body: json.RawMessage(tc.body)}, 1)[0]
+			if got.Command != tc.reply {
+				t.Fatalf("reply = 0x%x, want 0x%x", got.Command, tc.reply)
+			}
+			if tc.json != json.Valid(got.Body) || (!tc.json && len(got.Body) != 0) {
+				t.Fatalf("reply body = %q, want JSON=%v", got.Body, tc.json)
+			}
+		})
+	}
+}

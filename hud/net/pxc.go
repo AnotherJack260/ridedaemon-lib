@@ -72,6 +72,21 @@ const (
 	PxcQueryTimeAck  uint32 = PxcQueryTime + 1
 )
 
+// pxcCannedReplies are the requests the official app answers with a fixed body instead of an
+// empty cmd+1. Each is what CarbitRide sends with nothing behind it - no GPS fix offered, no
+// network shared - and a dash that parses the body found nothing in an empty one.
+var pxcCannedReplies = map[uint32]json.RawMessage{
+	// ECP_C2P_CHECK_NETWORK: {"status": the phone shares its network} (km/k.java:20-31).
+	0x10410: json.RawMessage(`{"status":false}`),
+	// QUERY_GPS: always false in CarbitRide, onReceiveQueryGps has no override
+	// (km/m0.java:29-50, sdk/t0.java:590).
+	0x10430: json.RawMessage(`{"status":false}`),
+	// ECP_C2P_CHECK_APP_NETWORKING_CAPABILITY: 0, m() has no override (km/i.java:20-32).
+	0x10750: json.RawMessage(`{"status":0}`),
+	// A text the dash wants shown on the phone; answered {} (km/l0.java:22-31).
+	0x104E0: json.RawMessage(`{}`),
+}
+
 type checkSnRequest struct {
 	ClientSet string `json:"client_set"`
 	Serial    string `json:"sn"`
@@ -930,15 +945,26 @@ func (s *PXCControl) handleEvent(event *PXCResponse, conn net.Conn) {
 		if event.Command&1 == 0 {
 			// Unknown even commands are requests. CFDL26 uses several JSON and
 			// binary notifications here and will not open 10921/10920 until ACKed.
+			//
+			// The official app answers a command it has no handler for with 0x80000010
+			// (sdk/b1.java:103-113) and every one it handles with cmd+1, empty unless it is
+			// in pxcCannedReplies (sdk/v0.java:50-66). The empty cmd+1 is kept for the rest
+			// anyway: the CFDL26 notifications above cannot be enumerated, and every command
+			// a Carbit-built dash has been seen sending is one the official app handles.
+			body := pxcCannedReplies[event.Command]
 			logging.Printf(
-				"Acknowledging unhandled PXC request command=0x%x bodyBytes=%d",
+				"Acknowledging unhandled PXC request command=0x%x bodyBytes=%d replyBytes=%d",
 				event.Command,
 				len(event.Body),
+				len(body),
 			)
 			s.emitEvent(*event)
-			response := &PXCResponse{Command: event.Command + 1}
+			response := &PXCResponse{Command: event.Command + 1, Body: body}
 			if err := s.writeResponse(response, conn, nil); err != nil {
 				s.emitError(s.connectionError(conn, PxcWriteErr, err))
+			} else if body != nil {
+				// As for QUERY_TIME: the only way a rider's log can show the body went out.
+				s.emitEvent(*response)
 			}
 		} else {
 			// Unknown odd commands are responses. Never answer them, otherwise
