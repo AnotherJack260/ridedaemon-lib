@@ -11,6 +11,8 @@ const (
 	PxcDecodeErr
 	PxcWriteErr
 	PxcHudCfgErr
+	// PxcTimeoutErr: the dash stopped answering within its own timeout.
+	PxcTimeoutErr
 )
 
 const (

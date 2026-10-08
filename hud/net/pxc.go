@@ -238,6 +238,8 @@ type PXCControl struct {
 	p2cReplies chan p2cFrame
 	// p2cTimeout is the dash's own reply timeout, from CLIENT_INFO; zero until it says.
 	p2cTimeout atomic.Int64
+	// lastHeardNanos is the last time the dash said anything on any PXC connection.
+	lastHeardNanos atomic.Int64
 }
 
 type pxcConnectionState struct {
@@ -255,6 +257,10 @@ type pxcConnectionState struct {
 	// superseded marks a phone channel the dash replaced with a newer one, so its closing is
 	// not reported as a failure.
 	superseded atomic.Bool
+	// answered: the dash has answered a command of ours on this phone channel.
+	answered atomic.Bool
+	// dashBeats: the dash keeps this channel alive with heartbeats of its own.
+	dashBeats atomic.Bool
 }
 
 func NewPXCControl(port string, kp *KeyPair, config *PhoneConfig) *PXCControl {
@@ -452,8 +458,10 @@ func (s *PXCControl) nameChannel(conn net.Conn, name string) {
 // noteHeard marks the moment the dash last spoke on this connection and clears the run of
 // unanswered keepalives.
 func (s *PXCControl) noteHeard(state *pxcConnectionState) {
-	state.lastRxNanos.Store(time.Now().UnixNano())
+	now := time.Now().UnixNano()
+	state.lastRxNanos.Store(now)
 	state.beatsSince.Store(0)
+	s.lastHeardNanos.Store(now)
 }
 
 func (s *PXCControl) releaseConnectionState(conn net.Conn) {
@@ -643,9 +651,14 @@ func (s *PXCControl) writeResponse(res *PXCResponse, conn net.Conn, raw *[]byte)
 	return nil
 }
 
-// Keep one selected PXC channel alive with empty 0x70000000 frames. A separate
-// loop is required for CAR_CTRL and CAR_DATA because either idle socket can
-// trigger a firmware-side teardown.
+// Keep the dash's request channel (CAR_CTRL) alive with empty 0x70000000 frames, for firmware
+// that never initiates heartbeats and tears down a channel gone quiet (CFMOTO 800NK / MTX800
+// need both channels kept, see 15df75c). The phone channel gets its beat from the P2C sender,
+// the only place CarbitRide beats (sdk/z.java:223-225, sdk/x0.java:192-209).
+//
+// CarbitRide never writes a command on the request channel; a dash built for it keeps that
+// channel alive itself, and a phone command there is the issue-#12 class of bug. So a beat is
+// skipped once the dash has shown its own keepalive on this channel.
 func (s *PXCControl) startChannelHeartbeat(conn net.Conn, channel string) {
 	if !s.proactiveHeartbeat || s.isStopping() {
 		return
@@ -666,6 +679,9 @@ func (s *PXCControl) startChannelHeartbeat(conn net.Conn, channel string) {
 				case <-state.done:
 					return
 				case <-ticker.C:
+					if state.dashBeats.Load() {
+						continue
+					}
 					if err := s.writeResponse(&PXCResponse{Command: PxcHeartbeat}, conn, nil); err != nil {
 						if !s.isStopping() {
 							logging.Printf("PXC %s heartbeat stopped: %v", channel, err)
@@ -708,7 +724,6 @@ func (s *PXCControl) handleEvent(event *PXCResponse, conn net.Conn) {
 		}
 		s.setPhoneChannel(conn)
 		s.startP2C()
-		s.startChannelHeartbeat(conn, "CAR_DATA")
 		// The official app's first APPSTATUS goes out as soon as this channel is up
 		// (b0.r -> ec/v -> t0.q0), before any capture is negotiated.
 		s.SendAppStatus(AppStatusBackground)
@@ -724,6 +739,7 @@ func (s *PXCControl) handleEvent(event *PXCResponse, conn net.Conn) {
 			break
 		}
 		s.HudConfig = &conf
+		s.noteSocketTimeout(conf.SocketTimeoutPeriodWifi)
 		// Set encrypted huid to phone config
 		if err := s.buildPC(); err != nil {
 			s.emitError(&PxcError{PxcHudCfgErr, err, true})
@@ -779,6 +795,7 @@ func (s *PXCControl) handleEvent(event *PXCResponse, conn net.Conn) {
 		}
 		s.sendCheckSnResult(&PXCResponse{Command: PxcCheckSnResult, Body: body}, conn)
 	case PxcHeartbeat:
+		s.connectionState(conn).dashBeats.Store(true)
 		s.emitEvent(*event) // Necessary to indicate PXC finished
 		response := &PXCResponse{Command: PxcHeartbeatOk}
 		if err := s.writeResponse(response, conn, nil); err != nil {

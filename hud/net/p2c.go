@@ -46,6 +46,9 @@ const (
 	// defaultP2CReplyTimeout is how long x0 waits for a reply when CLIENT_INFO carries no
 	// socketTimeoutPeriodWifi: 9 s on Wi-Fi (x0.a(), sdk/x0.java:86-113).
 	defaultP2CReplyTimeout = 9 * time.Second
+	// minP2CReplyTimeout floors the dash's own value. CarbitRide takes it as-is; the floor
+	// keeps a dash that states 1 s from being judged between two of its own 2 s heartbeats.
+	minP2CReplyTimeout = 3 * time.Second
 	// ponytail: CarbitRide warns at 100 queued and gives up at 1000 (sdk/z.java:167-187);
 	// nothing here queues more than a handful.
 	p2cQueueSize = 64
@@ -157,9 +160,16 @@ func (s *PXCControl) startP2C() {
 	})
 }
 
-// runP2C is x0.run(): take the next command, send it, wait for its answer.
+// runP2C is x0.run(): take the next command, send it, wait for its answer, and when nothing
+// has been queued for a heartbeat interval, send a heartbeat and wait for its answer the same
+// way (sdk/x0.java:184-224). The heartbeat stays opt-in (SetProactiveHeartbeat), as it was.
+//
+// ponytail: x0 also sends cmd 0 every 7th idle tick and expects 0x80000010
+// (sdk/x0.java:210-217); left out, since no dash has been seen to need it.
 func (s *PXCControl) runP2C() {
 	defer s.wg.Done()
+	idle := time.NewTimer(s.heartbeatEvery())
+	defer idle.Stop()
 	for {
 		select {
 		case <-s.quit:
@@ -171,8 +181,42 @@ func (s *PXCControl) runP2C() {
 			}
 			reply, err := s.p2cExchange(req.cmd, req.body, req.onWritten)
 			req.done <- p2cResult{reply: reply, err: err}
+		case <-idle.C:
+			if s.proactiveHeartbeat {
+				if _, err := s.p2cExchange(PxcHeartbeat, nil, nil); err != nil && !s.isStopping() {
+					logging.Printf("PXC CAR_DATA heartbeat: %v", err)
+				}
+			}
 		}
+		idle.Reset(s.heartbeatEvery())
 	}
+}
+
+// noteSocketTimeout takes CLIENT_INFO's socketTimeoutPeriodWifi as the reply timeout, as
+// x0.a() does (sdk/x0.java:86-113).
+func (s *PXCControl) noteSocketTimeout(seconds int) {
+	if seconds > 0 {
+		s.p2cTimeout.Store(int64(max(time.Duration(seconds)*time.Second, minP2CReplyTimeout)))
+	}
+}
+
+// judgeSilentDash ends the session when the dash has stopped answering. CarbitRide ends it as
+// soon as one P2C reply misses the dash's own timeout (sdk/x0.java:200-209, 263-274, then
+// t0.M0() at :328). Here that only happens when the dash has answered on this channel before
+// and has said nothing on ANY PXC connection for that long: a dash that abandons 0x20000 (the
+// Voge case in connectionError) or keeps talking on 0x10000 is alive and is left alone.
+func (s *PXCControl) judgeSilentDash(state *pxcConnectionState, cmd uint32, timeout time.Duration) {
+	if !state.answered.Load() {
+		return
+	}
+	silent := time.Since(time.Unix(0, s.lastHeardNanos.Load()))
+	if silent < timeout {
+		return
+	}
+	s.emitError(&PxcError{PxcTimeoutErr, fmt.Errorf(
+		"the dash stopped answering: no reply to 0x%x on the phone channel and nothing on any PXC channel for %s",
+		cmd, silent.Round(100*time.Millisecond),
+	), true})
 }
 
 // p2cReplyTimeout is the dash's own socketTimeoutPeriodWifi once CLIENT_INFO has stated it.
@@ -207,6 +251,9 @@ func (s *PXCControl) p2cExchange(cmd uint32, body []byte, onWritten func(net.Con
 	if onWritten != nil {
 		onWritten(conn, err)
 	}
+	if err == nil && cmd == PxcHeartbeat {
+		state.beatsSince.Add(1)
+	}
 	if err != nil || p2cNoReply(cmd) {
 		return nil, err
 	}
@@ -221,6 +268,7 @@ func (s *PXCControl) p2cExchange(cmd uint32, body []byte, onWritten func(net.Con
 		case <-state.done:
 			return nil, errors.New("the phone channel closed before the dash answered")
 		case <-timer.C:
+			s.judgeSilentDash(state, cmd, timeout)
 			return nil, fmt.Errorf("%w within %s", ErrPhoneCommandTimeout, timeout)
 		case frame := <-s.p2cReplies:
 			if frame.conn != conn {
@@ -242,6 +290,7 @@ func (s *PXCControl) p2cExchange(cmd uint32, body []byte, onWritten func(net.Con
 // deliverP2CReply hands a frame the dash wrote on a phone channel to the sender. x0 reads its
 // answers off the same socket it writes (sdk/x0.java:115-143).
 func (s *PXCControl) deliverP2CReply(conn net.Conn, event *PXCResponse) {
+	s.connectionState(conn).answered.Store(true)
 	select {
 	case s.p2cReplies <- p2cFrame{conn: conn, res: *event}:
 	default:

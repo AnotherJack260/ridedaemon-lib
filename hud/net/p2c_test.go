@@ -1,9 +1,12 @@
 package net
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"io"
 	stdnet "net"
+	"strings"
 	"testing"
 	"time"
 )
@@ -325,5 +328,175 @@ func TestTheNewestPhoneChannelWins(t *testing.T) {
 	sendAsync(control, 0x20110, nil, 0)
 	if got := readPXCResponse(t, newPhone); got.Command != 0x20110 {
 		t.Fatalf("on the new phone channel: 0x%x", got.Command)
+	}
+}
+
+// writeDashFrame writes one PXC frame the way the dash does.
+func writeDashFrame(t *testing.T, conn stdnet.Conn, cmd uint32, body []byte) {
+	t.Helper()
+	frame := make([]byte, pxcHeaderSize+len(body))
+	size := uint32(len(frame))
+	binary.LittleEndian.PutUint32(frame[0:], cmd)
+	binary.LittleEndian.PutUint32(frame[4:], size)
+	binary.LittleEndian.PutUint32(frame[8:], size^cmd)
+	copy(frame[pxcHeaderSize:], body)
+	if _, err := conn.Write(frame); err != nil {
+		t.Fatalf("dash write 0x%x: %v", cmd, err)
+	}
+}
+
+// startBeatingSession serves a dash that opens both channels, with the keepalive on and
+// collapsed to test speed. It returns the dash's ends of CAR_CTRL and CAR_DATA.
+func startBeatingSession(t *testing.T) (control *PXCControl, dashCtrl, dashData stdnet.Conn) {
+	t.Helper()
+	control = NewPXCControl(":0", nil, nil)
+	control.SetProactiveHeartbeat(true)
+	control.heartbeatInterval = 10 * time.Millisecond
+	control.p2cTimeout.Store(int64(150 * time.Millisecond))
+	carCtrl, dashCtrl := stdnet.Pipe()
+	carData, dashData := stdnet.Pipe()
+	for _, c := range []stdnet.Conn{carCtrl, dashCtrl, carData, dashData} {
+		c := c
+		t.Cleanup(func() { _ = c.Close() })
+	}
+	servePXCConn(t, control, carCtrl)
+	servePXCConn(t, control, carData)
+
+	// The dash keeps its own heartbeat on CAR_CTRL, as a CarbitRide-built dash does, so ours
+	// stops there and only the phone channel gets one.
+	writeDashFrame(t, dashCtrl, PxcHandshake, nil)
+	if got := readPXCResponse(t, dashCtrl); got.Command != PxcHandshakeOk {
+		t.Fatalf("handshake ack = 0x%x", got.Command)
+	}
+	writeDashFrame(t, dashCtrl, PxcHeartbeat, nil)
+	if got := readPXCResponse(t, dashCtrl); got.Command != PxcHeartbeatOk {
+		t.Fatalf("heartbeat ack = 0x%x", got.Command)
+	}
+	writeDashFrame(t, dashData, PxcChannelCarData, nil)
+	if got := readPXCResponse(t, dashData); got.Command != PxcChannelCarData+1 {
+		t.Fatalf("phone channel ack = 0x%x", got.Command)
+	}
+	return control, dashCtrl, dashData
+}
+
+func expectFatal(t *testing.T, control *PXCControl, within time.Duration) {
+	t.Helper()
+	deadline := time.After(within)
+	for {
+		select {
+		case err := <-control.Errors:
+			if fe, ok := err.(FatalError); ok && fe.IsFatal() {
+				if !strings.Contains(err.Error(), "stopped answering") {
+					t.Fatalf("fatal error does not say the dash stopped answering: %v", err)
+				}
+				return
+			}
+		case <-deadline:
+			t.Fatal("a dash that stopped answering was not declared dead")
+		}
+	}
+}
+
+func expectNoFatal(t *testing.T, control *PXCControl, during time.Duration) {
+	t.Helper()
+	deadline := time.After(during)
+	for {
+		select {
+		case err := <-control.Errors:
+			if fe, ok := err.(FatalError); ok && fe.IsFatal() {
+				t.Fatalf("a live dash was declared dead: %v", err)
+			}
+		case <-deadline:
+			return
+		}
+	}
+}
+
+// The heartbeat goes on the phone channel only, every idle interval, and waits for its answer
+// (sdk/x0.java:192-209). Once the dash beats on its request channel itself, nothing of ours is
+// written there.
+func TestHeartbeatGoesOnThePhoneChannelOnly(t *testing.T) {
+	_, dashCtrl, dashData := startBeatingSession(t)
+
+	for i := 0; i < 3; i++ {
+		if got := readPXCResponse(t, dashData); got.Command != PxcHeartbeat {
+			t.Fatalf("phone channel beat %d = 0x%x", i, got.Command)
+		}
+		writeDashFrame(t, dashData, PxcHeartbeatOk, nil)
+	}
+	assertSilent(t, dashCtrl, "the dash's request channel once it keeps its own heartbeat")
+}
+
+// A dash that answered and then went silent everywhere is dead after its own timeout, not
+// after the app's 20 s watchdog (x0.java:200-209, 263-274).
+func TestADashThatStopsAnsweringIsDeclaredDead(t *testing.T) {
+	control, _, dashData := startBeatingSession(t)
+
+	readPXCResponse(t, dashData)
+	writeDashFrame(t, dashData, PxcHeartbeatOk, nil)
+	readPXCResponse(t, dashData) // never answered
+
+	expectFatal(t, control, time.Second)
+}
+
+// Conservative on purpose: a dash still talking on its request channel is alive, whatever
+// happened to one answer on the phone channel.
+func TestADashStillTalkingElsewhereIsNotDeclaredDead(t *testing.T) {
+	control, dashCtrl, dashData := startBeatingSession(t)
+
+	readPXCResponse(t, dashData)
+	writeDashFrame(t, dashData, PxcHeartbeatOk, nil)
+	readPXCResponse(t, dashData) // never answered
+
+	stop := make(chan struct{})
+	defer close(stop)
+	go func() {
+		for {
+			select {
+			case <-stop:
+				return
+			case <-time.After(40 * time.Millisecond):
+			}
+			frame := make([]byte, pxcHeaderSize)
+			binary.LittleEndian.PutUint32(frame[0:], PxcHeartbeat)
+			binary.LittleEndian.PutUint32(frame[4:], pxcHeaderSize)
+			binary.LittleEndian.PutUint32(frame[8:], pxcHeaderSize^PxcHeartbeat)
+			if _, err := dashCtrl.Write(frame); err != nil {
+				return
+			}
+			if _, err := io.ReadFull(dashCtrl, frame); err != nil {
+				return
+			}
+		}
+	}()
+	expectNoFatal(t, control, 500*time.Millisecond)
+}
+
+// A dash that opens 0x20000 and never reads it (the abandoned-channel case behind
+// connectionError) never answered there, so its silence there proves nothing.
+func TestADashThatNeverAnsweredOnThePhoneChannelIsNotDeclaredDead(t *testing.T) {
+	control, _, dashData := startBeatingSession(t)
+
+	readPXCResponse(t, dashData) // never answered
+	expectNoFatal(t, control, 400*time.Millisecond)
+}
+
+// x0.a(): socketTimeoutPeriodWifi seconds, else 9 s (sdk/x0.java:86-113), floored so a dash
+// cannot be judged between two of its own beats.
+func TestReplyTimeoutIsTheDashOwn(t *testing.T) {
+	for _, tc := range []struct {
+		seconds int
+		want    time.Duration
+	}{
+		{0, 9 * time.Second},
+		{-5, 9 * time.Second},
+		{1, 3 * time.Second},
+		{12, 12 * time.Second},
+	} {
+		control := NewPXCControl(":0", nil, nil)
+		control.noteSocketTimeout(tc.seconds)
+		if got := control.p2cReplyTimeout(); got != tc.want {
+			t.Errorf("socketTimeoutPeriodWifi=%d: timeout %s, want %s", tc.seconds, got, tc.want)
+		}
 	}
 }
