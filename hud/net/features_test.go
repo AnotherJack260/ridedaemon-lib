@@ -2,6 +2,7 @@ package net
 
 import (
 	"bytes"
+	"encoding/json"
 	"reflect"
 	"strconv"
 	"testing"
@@ -216,5 +217,58 @@ func TestDashKeyAction(t *testing.T) {
 	}
 	if !AcquireBtA2dpAllowed(0, true, false) || AcquireBtA2dpAllowed(0, false, true) || !AcquireBtA2dpAllowed(1, false, true) {
 		t.Error("AcquireBtA2dpAllowed does not follow bluetoothPolicy bit 0")
+	}
+}
+
+// Every feature command now answers through the C2P registry, and the request still reaches the
+// event stream - which the host relays to OnEvent as source PXC - unchanged and exactly once, as
+// the default branch put it there: the same event, then the empty cmd+1, and nothing else. A body
+// that is not JSON gets the header-only 0x80000020 from a flavor-51 dash only.
+func TestFeatureCommandsAnswerThroughTheRegistryAndStillReachTheEventStream(t *testing.T) {
+	drain := func(c *PXCControl) (events []PXCResponse) {
+		for {
+			select {
+			case e := <-c.Events:
+				events = append(events, e)
+			default:
+				return events
+			}
+		}
+	}
+	for cmd := range featureDecoders {
+		if c2pHandler(cmd) == nil {
+			t.Fatalf("0x%x is not in the C2P registry", cmd)
+		}
+		for _, tc := range []struct {
+			name, flavor, body string
+			reply              uint32
+		}{
+			{"JSON", "", `{"code":4160,"type":2}`, cmd + 1},
+			{"empty", "51", ``, cmd + 1},
+			{"not JSON off flavor 51", "3", `x`, cmd + 1},
+			{"not JSON on flavor 51", "51", `x`, PxcStatusError},
+		} {
+			control := NewPXCControl(":0", nil, nil)
+			if tc.flavor != "" {
+				control.HudConfig = &HUDConfig{Flavor: json.RawMessage(tc.flavor)}
+			}
+			want := tc.reply
+			if cmd == PxcDashMainPage || cmd == PxcGoHome {
+				want = cmd + 1 // km/e1 reads no body
+			}
+			req := &PXCResponse{Command: cmd, Size: pxcHeaderSize + uint32(len(tc.body)), Body: json.RawMessage(tc.body)}
+			got := handlePXCEventAndReadResponses(t, control, req, 1)[0]
+			if got.Command != want || got.Size != pxcHeaderSize {
+				t.Fatalf("0x%x %s: reply 0x%x size %d, want 0x%x header only", cmd, tc.name, got.Command, got.Size, want)
+			}
+			events := drain(control)
+			if len(events) == 0 || events[0].Command != cmd || !bytes.Equal(events[0].Body, req.Body) {
+				t.Fatalf("0x%x %s: events %+v, want the request first", cmd, tc.name, events)
+			}
+			if want == cmd+1 && len(events) != 1 {
+				t.Fatalf("0x%x %s: %d events, want the request only", cmd, tc.name, len(events))
+			}
+			assertNoPXCError(t, control)
+		}
 	}
 }

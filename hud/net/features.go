@@ -6,6 +6,8 @@ import (
 	"errors"
 	"reflect"
 	"strings"
+
+	"github.com/charliecharlieO-o/ridedaemon-go/internal/logging"
 )
 
 // Dash feature messages: what CarbitRide 2.4 exchanges with a dash besides the picture -
@@ -18,7 +20,8 @@ import (
 // Every feature handler in CarbitRide answers with an empty cmd+1 (sdk/v0.java:50-66: none of
 // them sets a reply body), which is exactly what the default branch of handleEvent already
 // sends. The one difference is a body that is not JSON: CarbitRide's handler returns
-// C.RATE_UNSET_INT and the dispatch answers 0x80000020 instead (sdk/b1.java:129-147).
+// C.RATE_UNSET_INT and the dispatch answers 0x80000020 instead (sdk/b1.java:129-147); the
+// registry (init below) does the same for a flavor-51 dash.
 
 // FeatureHandler decodes one dash-to-phone feature command. reply is the body of the cmd+1
 // answer (always nil here); event is a pointer to one of the event types below, or nil when
@@ -57,6 +60,29 @@ func RegisterFeatureHandlers(register func(cmd uint32, handler func(body []byte)
 	for cmd, handler := range featureDecoders {
 		register(cmd, handler)
 	}
+}
+
+// The feature decoders answer through the C2P registry. answerRegistered still puts the request
+// on the PXC event stream first, exactly as the default branch did, and DashFeatures reads it from
+// there (api.MobileSession.relayEvent), so the decoded event is not needed here.
+func init() {
+	RegisterFeatureHandlers(func(cmd uint32, decode FeatureHandler) {
+		if cmd == PxcDashMainPage {
+			// 0x10380 is pageswitch.go's: the same empty ack, plus its transport event.
+			return
+		}
+		RegisterC2PHandler(cmd, func(s *PXCControl, req *PXCResponse) ([]byte, error) {
+			reply, _, err := decode(req.Body)
+			if err != nil && !s.flavor51Defaults() {
+				// ponytail: 0x80000020 only where Carbit's lifecycle applies; a CFMOTO-lineage
+				// dash keeps the empty cmd+1 the default branch always gave it (CFDL26 sends
+				// binary notices there). Widen once a capture shows one of these commands.
+				logging.Printf("PXC 0x%x: %v; acked anyway off flavor 51", req.Command, err)
+				return reply, nil
+			}
+			return reply, err
+		})
+	})
 }
 
 // DecodeFeatureCommand decodes one dash command if it is a feature command. ok is false for

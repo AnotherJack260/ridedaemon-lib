@@ -1,11 +1,15 @@
 package api
 
 import (
+	"bytes"
+	"encoding/binary"
 	"fmt"
+	stdnet "net"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/charliecharlieO-o/ridedaemon-go/hud/core"
 	"github.com/charliecharlieO-o/ridedaemon-go/hud/net"
 )
 
@@ -218,5 +222,82 @@ func TestBluetoothAndKeyboardGates(t *testing.T) {
 	*refuse = int64(net.PxcStatusUnsupported)
 	if err := f.SendNaviStatus(true); err == nil || !strings.Contains(err.Error(), "refused") {
 		t.Fatalf("refusal: %v", err)
+	}
+}
+
+type pxcEvent struct {
+	source, cmd int
+	payload     []byte
+}
+
+type eventsCallback struct{ events chan pxcEvent }
+
+func (c eventsCallback) OnError(string, bool) {}
+func (c eventsCallback) OnEvent(_ int64, source, cmd int, payload []byte) {
+	c.events <- pxcEvent{source, cmd, payload}
+}
+func (c eventsCallback) OnStopped() {}
+
+// awaitEvent waits for OnEvent(source, cmd); OnEvent runs on its own goroutine per event, so
+// others may come first.
+func awaitEvent(t *testing.T, events chan pxcEvent, source, cmd int) pxcEvent {
+	t.Helper()
+	timeout := time.After(3 * time.Second)
+	for {
+		select {
+		case e := <-events:
+			if e.source == source && e.cmd == cmd {
+				return e
+			}
+		case <-timeout:
+			t.Fatalf("OnEvent(%d, 0x%x) never came", source, cmd)
+		}
+	}
+}
+
+// A dash button, end to end through a real session: the C2P registry answers it with the empty
+// cmd+1 and the app still gets it from OnEvent as source PXC with its body, as before the feature
+// handlers were registered.
+func TestFeatureCommandReachesOnEventThroughTheRegistry(t *testing.T) {
+	for _, port := range []string{":10920", ":10921", ":10922"} {
+		ln, err := stdnet.Listen("tcp", port)
+		if err != nil {
+			t.Skipf("the session ports are busy on this machine: %v", err)
+		}
+		_ = ln.Close()
+	}
+	cb := eventsCallback{make(chan pxcEvent, 64)}
+	session, err := NewMobileSession(NewMobileConfig(nil, 30, 5, 2, 1, 1), cb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	hostEnd, deviceEnd := stdnet.Pipe()
+	defer hostEnd.Close()
+	started := make(chan error, 1)
+	go func() { started <- session.StartSessionOverUSB(pipeStream{deviceEnd}) }()
+
+	host := newADBHost(t, hostEnd)
+	host.send(0x4e584e43, 0x01000001, 256*1024, []byte("host::\x00"))
+	if p := <-host.packets; p[0] != 0x4e584e43 {
+		t.Fatalf("CNXN answered 0x%x", p[0])
+	}
+	ctrl := host.open(1, "tcp:10922")
+	body := []byte(`{"code":4160,"type":2}`)
+	host.send(0x45545257, 1, ctrl, pxc(net.PxcDashButton, body))
+	if got := host.await(1, 16); binary.LittleEndian.Uint32(got) != net.PxcDashButton+1 || binary.LittleEndian.Uint32(got[4:]) != 16 {
+		t.Fatalf("0x10350 answered %x", got)
+	}
+	if e := awaitEvent(t, cb.events, int(core.EventSourcePXC), int(net.PxcDashButton)); !bytes.Equal(e.payload, body) {
+		t.Fatalf("OnEvent payload %q, want %q", e.payload, body)
+	}
+
+	host.send(0x45545257, 1, ctrl, pxc(net.PxcHeartbeat, nil)) // the dash's first beat completes the start
+	if err := <-started; err != nil {
+		t.Fatalf("StartSessionOverUSB: %v", err)
+	}
+	if err := session.StopSession(); err != nil {
+		t.Fatal(err)
+	}
+	for range host.packets {
 	}
 }
