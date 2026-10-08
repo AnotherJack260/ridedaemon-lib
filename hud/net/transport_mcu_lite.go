@@ -305,11 +305,12 @@ func (m *MCULite) serveData(conn net.Conn) {
 	}
 
 	// c0.a: a watchdog of its own, restarted by every credit, so a frame the dash stopped reading
-	// cannot keep it from firing. It closes the data socket, which ends that write, and the
-	// session with it (c0.java:21-40).
+	// cannot keep it from firing. It ends the session, then closes the data socket, which ends
+	// that write (c0.java:21-40). In that order: once the socket closes this server returns and
+	// takes itself out of the session, and the teardown would find nothing of its own to end.
 	end := func(reason error) {
-		_ = conn.Close()
 		m.teardown(conn, reason)
+		_ = conn.Close()
 	}
 	watchdog := time.AfterFunc(timeout, func() {
 		end(fmt.Errorf("MCU-Lite: no frame credit from the dash for %s", timeout))

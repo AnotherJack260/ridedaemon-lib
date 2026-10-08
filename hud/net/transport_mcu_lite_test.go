@@ -594,3 +594,40 @@ func TestTheConnectionsOpeningPicksTheHandlerTable(t *testing.T) {
 		cancel()
 	}
 }
+
+// The watchdog tears the session down before it closes the data socket. The other way round, the
+// data server - which returns as soon as that socket closes - could take itself out of the session
+// first, and the teardown then found nothing of its own to end: the PXC channels stayed up and no
+// error was reported. The test holds the session's lock across the watchdog's firing: the data
+// socket must not close while the teardown is still waiting for it.
+func TestMCULiteWatchdogEndsTheSessionBeforeClosingTheData(t *testing.T) {
+	d := newMCULiteDash(t) // MirrorConfig at 10 fps: 100 ms between frames
+	d.ask(t, d.ctrl, MCULiteCmdStartMirror, mustHex(t, goldenMirrorConfig), MCULiteCmdStartMirror+1)
+	d.lite.watchdog = 30 * time.Millisecond
+	d.lite.PushJPEG([]byte{0xFF, 0xD8, 0xFF, 0xD9})
+	car, dash := stdnet.Pipe()
+	defer dash.Close()
+	_ = dash.SetDeadline(time.Now().Add(2 * time.Second))
+	if !d.serveData(car) {
+		t.Fatal("the data socket was not taken")
+	}
+	if _, err := dash.Write([]byte{1}); err != nil {
+		t.Fatal(err)
+	}
+	readMCUFrame(t, dash)
+
+	d.lite.mu.Lock()
+	_ = dash.SetReadDeadline(time.Now().Add(80 * time.Millisecond)) // the watchdog fires at 30 ms
+	_, err := dash.Read(make([]byte, 1))
+	d.lite.mu.Unlock()
+	if errors.Is(err, io.EOF) {
+		t.Fatal("the watchdog closed the data socket before it tore the session down")
+	}
+	_ = dash.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := dash.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+		t.Fatalf("the data socket was not closed: %v", err)
+	}
+	if err := readPXCError(t, d.control); !err.IsFatal() || !strings.Contains(err.Error(), "no frame credit") {
+		t.Fatalf("err = %v", err)
+	}
+}
