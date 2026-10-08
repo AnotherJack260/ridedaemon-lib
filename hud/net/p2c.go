@@ -80,8 +80,11 @@ type p2cRequest struct {
 	// internal caller can report what reached the wire without waiting for the ack.
 	onWritten func(conn net.Conn, err error)
 	// wait, when positive, replaces the dash's own timeout for this command's answer, and running
-	// out of it frees the sender without judging the dash or retiring the channel: ReleaseDash's.
+	// out of it frees the sender without judging the dash: ReleaseDash's. The channel is still
+	// retired for it, once the chain it belongs to is done (runP2CChain).
 	wait time.Duration
+	// then is sent right after this one, with nothing of anyone else's between them.
+	then *p2cRequest
 	done chan p2cResult // buffered: the sender never blocks on a caller that left
 }
 
@@ -149,7 +152,9 @@ func (s *PXCControl) enqueueP2C(req *p2cRequest) error {
 	if s.phoneChannel() == nil {
 		return ErrNoPhoneChannel
 	}
-	req.done = make(chan p2cResult, 1)
+	for r := req; r != nil; r = r.then {
+		r.done = make(chan p2cResult, 1)
+	}
 	select {
 	case s.p2cQueue <- req:
 		return nil
@@ -184,12 +189,7 @@ func (s *PXCControl) runP2C() {
 			return
 		case req := <-s.p2cQueue:
 			idleTicks = 0
-			if !req.deadline.IsZero() && time.Now().After(req.deadline) {
-				req.done <- p2cResult{err: errPhoneCommandExpired}
-				continue
-			}
-			reply, err := s.p2cExchange(req.cmd, req.body, req.wait, req.onWritten)
-			req.done <- p2cResult{reply: reply, err: err}
+			s.runP2CChain(req)
 		case <-idle.C:
 			// Only while there is a phone channel: once the dash has closed it, there is
 			// nothing to keep alive and nothing to log every 2 s.
@@ -210,6 +210,29 @@ func (s *PXCControl) runP2C() {
 			}
 		}
 		idle.Reset(s.heartbeatEvery())
+	}
+}
+
+// runP2CChain sends req and the requests chained to it (then), back to back. A request with its own
+// wait that ran out of it went unanswered all the same: its answer can still come, and once the
+// chain is done the channel it went out on is retired for that, as for any unanswered command.
+func (s *PXCControl) runP2CChain(req *p2cRequest) {
+	conn, unanswered := s.phoneChannel(), false
+	for ; req != nil; req = req.then {
+		if s.isStopping() {
+			req.done <- p2cResult{err: errSessionStopping}
+			continue
+		}
+		if !req.deadline.IsZero() && time.Now().After(req.deadline) {
+			req.done <- p2cResult{err: errPhoneCommandExpired}
+			continue
+		}
+		reply, err := s.p2cExchange(req.cmd, req.body, req.wait, req.onWritten)
+		unanswered = unanswered || (req.wait > 0 && errors.Is(err, ErrPhoneCommandTimeout))
+		req.done <- p2cResult{reply: reply, err: err}
+	}
+	if unanswered && conn != nil {
+		s.retire(conn, errors.New("a command went unanswered on the phone channel within its own wait"))
 	}
 }
 

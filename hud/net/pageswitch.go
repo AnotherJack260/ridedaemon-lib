@@ -394,34 +394,37 @@ func (s *PXCControl) SwitchEcToFront() {
 // (ec/v.java:1695-1704; HomeActivity.java:896-898). Each waits for the dash's answer at most a
 // second, as the official app waits for STOP_SERVICE's (utils/PxcUtils.java:80-114), and that
 // second frees the sender: a dash that leaves switchEc2Background unanswered still gets
-// STOP_SERVICE. Neither is dropped for waiting its turn, so STOP_SERVICE is on the wire before
-// ReleaseDash returns; a command already in flight holds them up for at most the dash's own
-// timeout. It sends both whatever the dash's flavor: the host asked. Returns STOP_SERVICE's outcome.
+// STOP_SERVICE. The two go out back to back, nothing else between them, and neither is dropped
+// for waiting its turn, so STOP_SERVICE is on the wire before ReleaseDash returns; a command
+// already in flight holds them up for at most the dash's own timeout. If either went unanswered
+// the phone channel is retired after them (runP2CChain). It sends both whatever the dash's
+// flavor: the host asked. Returns STOP_SERVICE's outcome.
 func (s *PXCControl) ReleaseDash() error {
-	if err := s.releaseCommand(PxcSwitchEcToBackground); err != nil {
+	stop := &p2cRequest{cmd: PxcStopService, wait: releaseDashWait}
+	background := &p2cRequest{cmd: PxcSwitchEcToBackground, wait: releaseDashWait, then: stop}
+	if err := s.enqueueP2C(background); err != nil {
+		return fmt.Errorf("phone command 0x%x: %w", background.cmd, err)
+	}
+	if err := s.awaitP2C(background); err != nil {
 		if errors.Is(err, ErrNoPhoneChannel) || errors.Is(err, errSessionStopping) {
 			return err
 		}
 		logging.Printf("PXC release: %v; sending STOP_SERVICE anyway", err)
 	}
-	return s.releaseCommand(PxcStopService)
+	return s.awaitP2C(stop)
 }
 
-// releaseCommand queues one of ReleaseDash's commands and waits until it is written and answered,
-// or its releaseDashWait has run out.
-func (s *PXCControl) releaseCommand(cmd uint32) error {
-	req := &p2cRequest{cmd: cmd, wait: releaseDashWait}
-	err := s.enqueueP2C(req)
-	if err == nil {
-		select {
-		case r := <-req.done:
-			err = r.err
-		case <-s.quit:
-			err = errSessionStopping
-		}
+// awaitP2C waits for a queued request's outcome.
+func (s *PXCControl) awaitP2C(req *p2cRequest) error {
+	var err error
+	select {
+	case r := <-req.done:
+		err = r.err
+	case <-s.quit:
+		err = errSessionStopping
 	}
 	if err != nil {
-		return fmt.Errorf("phone command 0x%x: %w", cmd, err)
+		return fmt.Errorf("phone command 0x%x: %w", req.cmd, err)
 	}
 	return nil
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	stdnet "net"
 	"testing"
 	"time"
@@ -336,7 +337,8 @@ func TestReleaseDash(t *testing.T) {
 
 // A dash that leaves switchEc2Background unanswered still gets STOP_SERVICE: the first command's
 // second frees the sender, which would otherwise wait out the dash's own 9 s while STOP_SERVICE
-// expired in the queue. Neither short wait retires the channel.
+// expired in the queue. A command queued meanwhile goes after the pair, never between, and since
+// an answer to the pair may still come, the channel is retired before that command can take it.
 func TestReleaseDashSendsStopServiceWhenTheFirstGoesUnanswered(t *testing.T) {
 	for _, stopAnswered := range []bool{true, false} {
 		control := NewPXCControl(":0", nil, nil) // the dash's own timeout: the default 9 s
@@ -349,8 +351,9 @@ func TestReleaseDashSendsStopServiceWhenTheFirstGoesUnanswered(t *testing.T) {
 		if got := readPXCResponse(t, phone); got.Command != PxcSwitchEcToBackground {
 			t.Fatalf("first: 0x%x", got.Command)
 		}
+		other := sendAsync(control, 0x20110, nil, 0)
 		if got := readPXCResponse(t, phone); got.Command != PxcStopService {
-			t.Fatalf("second: 0x%x", got.Command)
+			t.Fatalf("second: 0x%x, want STOP_SERVICE before anything queued later", got.Command)
 		}
 		if elapsed := time.Since(start); elapsed > 3*releaseDashWait/2 {
 			t.Fatalf("STOP_SERVICE went out after %v, want about %v", elapsed, releaseDashWait)
@@ -369,8 +372,11 @@ func TestReleaseDashSendsStopServiceWhenTheFirstGoesUnanswered(t *testing.T) {
 		case <-time.After(3 * time.Second):
 			t.Fatal("ReleaseDash() never returned")
 		}
-		if control.phoneChannel() == nil {
-			t.Fatal("ReleaseDash's own short wait retired the phone channel")
+		if r := awaitResult(t, other); !errors.Is(r.err, ErrNoPhoneChannel) {
+			t.Fatalf("the command queued behind the release: %+v, %v; want ErrNoPhoneChannel", r.reply, r.err)
+		}
+		if _, err := phone.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+			t.Fatalf("the phone channel was kept for a late answer to the release: %v", err)
 		}
 	}
 }
