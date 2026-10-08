@@ -232,6 +232,21 @@ func coerceJSON(field reflect.Value, raw json.RawMessage) {
 	}
 }
 
+// optLong reads one raw JSON field the way JSONObject.optLong / getInt do: a number, or text
+// holding one, truncated as Number.longValue() truncates. ok is false for anything else,
+// absence included.
+func optLong(raw json.RawMessage) (value int64, ok bool) {
+	var n json.Number
+	if len(raw) == 0 || json.Unmarshal(raw, &n) != nil {
+		return 0, false
+	}
+	if i, err := n.Int64(); err == nil {
+		return i, true
+	}
+	f, err := n.Float64()
+	return int64(f), err == nil
+}
+
 type PhoneConfig struct {
 	PxcVersion        string `json:"pxcVersion"`
 	PhoneUUID         string `json:"phoneUUID"`
@@ -319,6 +334,10 @@ type PXCControl struct {
 	OnAppStatus func(mode int, err error)
 
 	clientInfoMu sync.Mutex
+
+	// noFlavor51Lifecycle turns off what a flavor-51 dash gets by default; see carbitLifecycle.
+	noFlavor51Lifecycle bool
+	ecFrontOnce         sync.Once
 
 	// The phone channel and its one sender; see p2c.go and phoneChannel.
 	phoneMu    sync.Mutex
@@ -598,6 +617,47 @@ func (s *PXCControl) maybeScheduleProactiveQueryTime(conn net.Conn) {
 			s.emitEvent(*response)
 		}()
 	})
+}
+
+// hudConfig is the dash's CLIENT_INFO, or nil before it, for readers off the connection that
+// stored it.
+func (s *PXCControl) hudConfig() *HUDConfig {
+	s.clientInfoMu.Lock()
+	defer s.clientInfoMu.Unlock()
+	return s.HudConfig
+}
+
+// dashChannel is CLIENT_INFO's channel, "" before it.
+func (s *PXCControl) dashChannel() string {
+	if conf := s.hudConfig(); conf != nil {
+		return conf.Channel
+	}
+	return ""
+}
+
+// flavor51 reports a dash whose CLIENT_INFO says flavor 51: CarbitRide's own family (the Zontes
+// JCDZ21 among them), the only one known to be built against the official app's phone side.
+func (s *PXCControl) flavor51() bool {
+	conf := s.hudConfig()
+	return conf != nil && strings.Trim(string(bytes.TrimSpace(conf.Flavor)), `"`) == "51"
+}
+
+// SetFlavor51Lifecycle controls what a flavor-51 dash gets without any profile asking: the
+// official app's APPSTATUS announcements and its switch to the mirror page at stream start
+// (carbitLifecycle). On by default; false restores the wire every earlier build put in front of
+// that dash. Configure it before Start.
+func (s *PXCControl) SetFlavor51Lifecycle(enabled bool) {
+	s.noFlavor51Lifecycle = !enabled
+}
+
+// carbitLifecycle reports whether this dash gets the official app's unsolicited lifecycle
+// commands: a profile asked for them (SetAppStatusNotify), or the dash is flavor 51. Every
+// other dashboard paints today without ever having seen one of them from us.
+func (s *PXCControl) carbitLifecycle() bool {
+	s.appStatus.mu.Lock()
+	enabled := s.appStatus.enabled
+	s.appStatus.mu.Unlock()
+	return enabled || (!s.noFlavor51Lifecycle && s.flavor51())
 }
 
 func (s *PXCControl) connectionState(conn net.Conn) *pxcConnectionState {
@@ -881,7 +941,7 @@ func (s *PXCControl) handleEvent(event *PXCResponse, conn net.Conn) {
 		s.startP2C()
 		// The official app's first APPSTATUS goes out as soon as this channel is up
 		// (b0.r -> ec/v -> t0.q0), before any capture is negotiated.
-		s.SendAppStatus(AppStatusBackground)
+		s.announceAppStatus()
 	case PxcHudConf:
 		s.answerClientInfo(event, conn)
 	case PxcSpeedConf:
@@ -1037,6 +1097,8 @@ func (s *PXCControl) answerClientInfo(event *PXCResponse, conn net.Conn) {
 	}
 	s.emitEvent(*response)
 	s.maybeScheduleProactiveQueryTime(conn)
+	// A phone channel opened before CLIENT_INFO could not tell a flavor-51 dash yet.
+	s.announceAppStatus()
 }
 
 func (s *PXCControl) clientInfoReply(body []byte) ([]byte, error) {

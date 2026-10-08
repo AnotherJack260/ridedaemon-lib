@@ -3,6 +3,7 @@ package net
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	stdnet "net"
 	"testing"
 	"time"
@@ -188,4 +189,154 @@ func nextStep(t *testing.T, steps <-chan PageSwitchProbeStep) PageSwitchProbeSte
 // would.
 func dashAnswers(control *PXCControl, conn stdnet.Conn, command PXCResponse) {
 	control.handleEvent(&PXCResponse{Command: command.Command + 1}, conn)
+}
+
+// flavor51Control is a session whose dash said flavor 51 in CLIENT_INFO, as the Zontes JCDZ21 does.
+func flavor51Control(channel string) *PXCControl {
+	control := NewPXCControl(":0", nil, nil)
+	control.HudConfig = &HUDConfig{Flavor: json.RawMessage(`51`), Channel: channel}
+	return control
+}
+
+// The dash's lifecycle requests are acked with an empty cmd+1, as the official app acks every
+// command it handles (sdk/v0.java:50-66), and each reaches the host as a typed transport event
+// numbered after the request.
+func TestDashLifecycleRequestsBecomeTransportEvents(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		cmd     uint32
+		body    string
+		payload []byte
+		event   bool
+	}{
+		{"dash asks to disconnect (km/u0)", PxcDashDisconnect, "", nil, true},
+		{"dash UI to front (km/c1)", PxcDashUiFront, "", nil, true},
+		{"dash asks for the phone home page (km/e1)", PxcDashMainPage, "", nil, true},
+		{"switch to page 7 (nec/d.java:111-128)", PxcSwitchToAppPage, `{"type":7}`, []byte{0, 0, 0, 7, 0, 0, 0, 0}, true},
+		{"switch to page 21 with a channel", PxcSwitchToAppPage, `{"type":"21","channel":3}`, []byte{0, 0, 0, 21, 0, 0, 0, 3}, true},
+		{"switch with no page", PxcSwitchToAppPage, `{"channel":3}`, nil, false},
+		{"switch with a body that is not JSON (km/d1 catches it)", PxcSwitchToAppPage, `nope`, nil, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			control := NewPXCControl(":0", nil, nil)
+			type event struct {
+				cmd     int
+				payload []byte
+			}
+			var events []event
+			control.OnTransport = func(cmd int, payload []byte) { events = append(events, event{cmd, payload}) }
+
+			got := handlePXCEventAndReadResponses(t, control, &PXCResponse{Command: tc.cmd, Body: []byte(tc.body)}, 1)[0]
+			if got.Command != tc.cmd+1 || len(got.Body) != 0 {
+				t.Fatalf("reply = 0x%x %q, want an empty 0x%x", got.Command, got.Body, tc.cmd+1)
+			}
+			if !tc.event {
+				if len(events) != 0 {
+					t.Fatalf("events = %v, want none", events)
+				}
+				return
+			}
+			if len(events) != 1 || events[0].cmd != int(tc.cmd) || string(events[0].payload) != string(tc.payload) {
+				t.Fatalf("events = %v, want one 0x%x with %v", events, tc.cmd, tc.payload)
+			}
+		})
+	}
+}
+
+// Asked for the phone screen (101), the official app states that page open on the phone channel
+// (nec/d.java:146-152).
+func TestPhoneScreenPageRequestIsAnsweredWithPageStatus(t *testing.T) {
+	control := NewPXCControl(":0", nil, nil)
+	requestClient, request := openControlChannel(t, control)
+	_, phone := openPhoneChannel(t, control)
+
+	go control.handleEvent(&PXCResponse{Command: PxcSwitchToAppPage, Body: []byte(`{"type":101}`)}, requestClient)
+	if got := readPXCResponse(t, request); got.Command != PxcSwitchToAppPage+1 {
+		t.Fatalf("on the request channel: 0x%x", got.Command)
+	}
+	got := readPXCResponse(t, phone)
+	if got.Command != PxcPageStatus || string(got.Body) != `{"page":101,"status":1,"type":0}` {
+		t.Fatalf("on the phone channel: 0x%x %s", got.Command, got.Body)
+	}
+}
+
+// switchEc2Front goes out once, on the phone channel, to a flavor-51 dash - except to the three
+// channels the official app skips (sdk/b0.java:369-412, 696-707) - and to no other dash unless
+// its profile asked for the official app's announcements.
+func TestSwitchEcToFront(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		control func() *PXCControl
+		want    bool
+	}{
+		{"Zontes, flavor 51 channel 21321", func() *PXCControl { return flavor51Control("21321") }, true},
+		{"flavor 51 channel 5417", func() *PXCControl { return flavor51Control("5417") }, false},
+		{"another flavor", func() *PXCControl { return NewPXCControl(":0", nil, nil) }, false},
+		{"another flavor whose profile opted in", func() *PXCControl {
+			c := NewPXCControl(":0", nil, nil)
+			c.SetAppStatusNotify(true)
+			return c
+		}, true},
+		{"flavor 51, host opted out", func() *PXCControl {
+			c := flavor51Control("21321")
+			c.SetFlavor51Lifecycle(false)
+			return c
+		}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			control := tc.control()
+			_, request := openControlChannel(t, control)
+			client, phone := openPhoneChannel(t, control)
+			if control.carbitLifecycle() {
+				// The phone channel opening announced mode 2 first; ack it.
+				expectAppStatus(t, control, client, phone, PxcAppStatus, AppStatusBackground)
+			}
+
+			control.SwitchEcToFront()
+			control.SwitchEcToFront()
+			if tc.want {
+				if got := readPXCResponse(t, phone); got.Command != PxcSwitchEcToFront || len(got.Body) != 0 {
+					t.Fatalf("on the phone channel: 0x%x %q", got.Command, got.Body)
+				}
+				control.handleEvent(&PXCResponse{Command: PxcSwitchEcToFront + 1}, client)
+			}
+			assertSilent(t, phone, "the phone channel")
+			assertSilent(t, request, "the dash's request channel")
+		})
+	}
+}
+
+// ReleaseDash sends switchEc2Background then STOP_SERVICE, each after the previous one's answer,
+// and sends STOP_SERVICE even when the dash refuses the first.
+func TestReleaseDash(t *testing.T) {
+	for _, first := range []uint32{PxcSwitchEcToBackground + 1, PxcStatusUnsupported} {
+		control := NewPXCControl(":0", nil, nil)
+		client, phone := openPhoneChannel(t, control)
+		done := make(chan error, 1)
+		go func() { done <- control.ReleaseDash() }()
+
+		if got := readPXCResponse(t, phone); got.Command != PxcSwitchEcToBackground {
+			t.Fatalf("first: 0x%x", got.Command)
+		}
+		control.handleEvent(&PXCResponse{Command: first}, client)
+		if got := readPXCResponse(t, phone); got.Command != PxcStopService {
+			t.Fatalf("second: 0x%x", got.Command)
+		}
+		control.handleEvent(&PXCResponse{Command: PxcStopService + 1}, client)
+		select {
+		case err := <-done:
+			if err != nil {
+				t.Fatalf("ReleaseDash() = %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("ReleaseDash() never returned")
+		}
+	}
+}
+
+func TestReleaseDashWithoutPhoneChannelSaysSo(t *testing.T) {
+	control := NewPXCControl(":0", nil, nil)
+	if err := control.ReleaseDash(); !errors.Is(err, ErrNoPhoneChannel) {
+		t.Fatalf("ReleaseDash() = %v, want ErrNoPhoneChannel", err)
+	}
 }

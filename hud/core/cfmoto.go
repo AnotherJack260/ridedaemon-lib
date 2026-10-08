@@ -104,6 +104,8 @@ type CfmotoHUD struct {
 	pageSwitchProbe       bool
 	jpegStills            bool
 	appStatusNotify       bool
+	noFlavor51Lifecycle   bool
+	appForeground         bool
 	phoneScreen           net.PhoneScreen
 	timeZoneID            string
 	timeZoneOffsetSec     int
@@ -210,6 +212,26 @@ func (hud *CfmotoHUD) SetAppStatusNotify(enabled bool) {
 	hud.mu.Lock()
 	defer hud.mu.Unlock()
 	hud.appStatusNotify = enabled
+}
+
+// SetFlavor51Lifecycle controls the official app's lifecycle commands a flavor-51 dash gets by
+// default. See net.PXCControl.SetFlavor51Lifecycle. Configure it before StartStream.
+func (hud *CfmotoHUD) SetFlavor51Lifecycle(enabled bool) {
+	hud.mu.Lock()
+	defer hud.mu.Unlock()
+	hud.noFlavor51Lifecycle = !enabled
+}
+
+// SetAppForeground says whether the host's own UI is in the phone's foreground, which turns the
+// APPSTATUS notification into 0x20020. Takes effect at once on a running session.
+func (hud *CfmotoHUD) SetAppForeground(foreground bool) {
+	hud.mu.Lock()
+	hud.appForeground = foreground
+	pxc := hud.pxcControl
+	hud.mu.Unlock()
+	if pxc != nil {
+		pxc.SetAppForeground(foreground)
+	}
 }
 
 // SetPhoneScreen supplies the display metrics that notification carries. Only the host
@@ -477,6 +499,11 @@ func (hud *CfmotoHUD) startStream(ctx context.Context, initConn stdnet.Conn) (er
 		})
 	}
 	pxcServer.SetAppStatusNotify(hud.appStatusNotify)
+	pxcServer.SetFlavor51Lifecycle(!hud.noFlavor51Lifecycle)
+	hud.mu.Lock()
+	foreground := hud.appForeground // the one setter the host may call while this runs
+	hud.mu.Unlock()
+	pxcServer.SetAppForeground(foreground)
 	pxcServer.SetPhoneScreen(hud.phoneScreen)
 	pxcServer.OnAppStatus = func(mode int, err error) {
 		payload := make([]byte, 2)
@@ -520,6 +547,9 @@ func (hud *CfmotoHUD) startStream(ctx context.Context, initConn stdnet.Conn) (er
 		// once REQ_RV_DATA_START has been answered 113. This is that instant on our
 		// side: the dash has asked for the stream and the live consumer is armed.
 		pxcServer.SendAppStatus(net.AppStatusMirrorLive)
+		// switchEc2Front goes out when the phone's stream starts and no frame has reached the
+		// dash yet (sdk/b0.java:696-707), which is now.
+		pxcServer.SwitchEcToFront()
 	}
 	// -- maybe we could change chunkStep to something smaller to reduce latency?
 	mediaStream := net.NewMediaStream(":10920", hud.muxSource, 0x1000, 3*time.Millisecond)
@@ -689,6 +719,18 @@ func (hud *CfmotoHUD) SendPhoneCommand(cmd uint32, body []byte, timeout time.Dur
 		return nil, errors.New("the session is not running")
 	}
 	return pxc.SendPhoneCommand(cmd, body, timeout)
+}
+
+// ReleaseDash hands the dash back its own UI before the session stops. See
+// net.PXCControl.ReleaseDash.
+func (hud *CfmotoHUD) ReleaseDash() error {
+	hud.mu.Lock()
+	pxc := hud.pxcControl
+	hud.mu.Unlock()
+	if pxc == nil {
+		return errors.New("the session is not running")
+	}
+	return pxc.ReleaseDash()
 }
 
 func (hud *CfmotoHUD) IsRunning() bool {

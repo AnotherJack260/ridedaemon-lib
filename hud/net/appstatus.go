@@ -47,6 +47,10 @@ const (
 	PxcAppStatus uint32 = 0x20030
 	// PxcAppStatusAck is the cmd+1 the dash owes it.
 	PxcAppStatusAck uint32 = PxcAppStatus + 1
+	// PxcAppStatusForeground is ECP_P2C_APPSTATUS_FOREGROUND (mm/c.java): the same body, sent
+	// instead of 0x20030 while the official app's own UI is in the phone's foreground
+	// (t0.q0, common/base/t0.java:1077-1087; o() is BaseActivity.isShowing, ec/b.java:1115-1118).
+	PxcAppStatusForeground uint32 = 0x20020
 )
 
 // Mode values from kh.b.a(int) and its two call sites in n0.java.
@@ -75,20 +79,34 @@ type PhoneScreen struct {
 
 // appStatusState is the per-session half of this file.
 type appStatusState struct {
-	mu      sync.Mutex
-	enabled bool
-	screen  PhoneScreen
-	sent    map[int]bool
+	mu         sync.Mutex
+	enabled    bool
+	screen     PhoneScreen
+	mode       int  // what the phone is doing now; 0 until told, which reads as AppStatusBackground
+	foreground bool // the host's own UI is in the phone's foreground: send 0x20020
+	// What last went out, so the same statement is never made twice in a row.
+	lastCmd  uint32
+	lastMode int
 }
 
-// SetAppStatusNotify enables the ECP_P2C_APPSTATUS_BACKGROUND notifications above.
-// Opt-in and off by default, for the same reason the page probe was: it puts an
-// unsolicited command on a wire that every dashboard painting a picture today has
-// never seen from us. Configure it before StartStream.
+// SetAppStatusNotify enables the ECP_P2C_APPSTATUS_BACKGROUND notifications above for any
+// dash. Without it they go only to a flavor-51 dash (see carbitLifecycle), the one family
+// known to be built against the official app: for every other dashboard this is an
+// unsolicited command it has never seen from us. Configure it before StartStream.
 func (s *PXCControl) SetAppStatusNotify(enabled bool) {
 	s.appStatus.mu.Lock()
 	defer s.appStatus.mu.Unlock()
 	s.appStatus.enabled = enabled
+}
+
+// SetAppForeground says whether the host's own UI is in the phone's foreground. The official
+// app states its mirroring mode with 0x20020 instead of 0x20030 while its UI is showing, and
+// states it again whenever that changes (t0.q0, common/base/t0.java:1067-1109).
+func (s *PXCControl) SetAppForeground(foreground bool) {
+	s.appStatus.mu.Lock()
+	s.appStatus.foreground = foreground
+	s.appStatus.mu.Unlock()
+	s.announceAppStatus()
 }
 
 // SetPhoneScreen supplies the display metrics the body carries. Zero dimensions are
@@ -100,7 +118,11 @@ func (s *PXCControl) SetPhoneScreen(screen PhoneScreen) {
 	s.appStatus.screen = screen
 }
 
-// buildAppStatusBody reproduces kh.b's constructor followed by kh.b.a(mode).
+// buildAppStatusBody reproduces kh.b's constructor followed by kh.b.a(mode). Checked against
+// CarbitRide 2.4, where the class is mm/b.java: the constructor (:110-150) writes the same five
+// keys and a(mode) (:75-87) the mode plus the upright override for mode 2. Its only other key,
+// mirrorOverlayPos (with uncoveredArea inside), is written only for an overlay - mode 3 - which
+// nothing here produces, so this is the full body for every mode this library sends.
 func buildAppStatusBody(screen PhoneScreen, mode int) ([]byte, error) {
 	minSide, maxSide := screen.Width, screen.Height
 	if minSide > maxSide {
@@ -133,29 +155,43 @@ func buildAppStatusBody(screen PhoneScreen, mode int) ([]byte, error) {
 	})
 }
 
-// SendAppStatus pushes one ECP_P2C_APPSTATUS_BACKGROUND on the phone channel, and only
-// there (see phoneChannel). It is a no-op when the notification is not enabled, when the session is
-// stopping, or when the same mode has already gone out on this session - a dash that
-// says STREAM_START twice must not be told twice that the mirror went live.
+// SendAppStatus records what the phone is now doing - AppStatusMirrorLive once the dash pulls
+// the stream - and states it to the dash (announceAppStatus).
 func (s *PXCControl) SendAppStatus(mode int) {
 	s.appStatus.mu.Lock()
-	enabled, screen := s.appStatus.enabled, s.appStatus.screen
-	already := s.appStatus.sent[mode]
-	if enabled && !already {
-		if s.appStatus.sent == nil {
-			s.appStatus.sent = map[int]bool{}
-		}
-		s.appStatus.sent[mode] = true
-	}
+	s.appStatus.mode = mode
 	s.appStatus.mu.Unlock()
+	s.announceAppStatus()
+}
 
-	if !enabled || already || s.isStopping() {
+// announceAppStatus pushes the phone's current mode as ECP_P2C_APPSTATUS_BACKGROUND (or
+// _FOREGROUND) on the phone channel, and only there (see phoneChannel). The official app sends
+// it when the phone channel comes up (b0.r -> ec/v -> t0.q0) and again on every change. It is a
+// no-op when the notification does not apply to this dash, when the session is stopping, or when
+// it would repeat the last one sent - a dash that says STREAM_START twice must not be told twice
+// that the mirror went live, and a reopened phone channel is not told "not mirroring" mid-mirror.
+func (s *PXCControl) announceAppStatus() {
+	if s.isStopping() || !s.carbitLifecycle() {
+		return
+	}
+	s.appStatus.mu.Lock()
+	screen, mode, cmd := s.appStatus.screen, s.appStatus.mode, PxcAppStatus
+	if mode == 0 {
+		mode = AppStatusBackground
+	}
+	if s.appStatus.foreground {
+		cmd = PxcAppStatusForeground
+	}
+	repeat := s.appStatus.lastCmd == cmd && s.appStatus.lastMode == mode
+	s.appStatus.lastCmd, s.appStatus.lastMode = cmd, mode
+	s.appStatus.mu.Unlock()
+	if repeat {
 		return
 	}
 
 	body, err := buildAppStatusBody(screen, mode)
 	if err != nil {
-		s.emitError(&PxcError{PxcWriteErr, fmt.Errorf("encode APPSTATUS_BACKGROUND: %w", err), true})
+		s.emitError(&PxcError{PxcWriteErr, fmt.Errorf("encode APPSTATUS: %w", err), true})
 		s.noteAppStatus(mode, err)
 		return
 	}
@@ -163,8 +199,8 @@ func (s *PXCControl) SendAppStatus(mode int) {
 	// Phone channel only, through the queue (see p2c.go). No fallback: CarbitRide's t0.q0
 	// returns early when its P2C socket is down, and the request channel is where a Zontes
 	// hung up on this command (issue #12).
-	_, err = s.queueP2C(PxcAppStatus, body, time.Time{}, func(conn net.Conn, err error) {
-		logging.Printf("PXC app status: sent 0x%x mode=%d body=%s err=%v", PxcAppStatus, mode, body, err)
+	_, err = s.queueP2C(cmd, body, time.Time{}, func(conn net.Conn, err error) {
+		logging.Printf("PXC app status: sent 0x%x mode=%d body=%s err=%v", cmd, mode, body, err)
 		s.noteAppStatus(mode, err)
 		if err != nil && conn != nil {
 			s.emitError(s.connectionError(conn, PxcWriteErr, err))
@@ -172,6 +208,10 @@ func (s *PXCControl) SendAppStatus(mode int) {
 	})
 	if err != nil {
 		logging.Printf("PXC app status: mode=%d not sent: %v", mode, err)
+		// Never queued, so never said: the next announcement must not be taken for a repeat.
+		s.appStatus.mu.Lock()
+		s.appStatus.lastCmd, s.appStatus.lastMode = 0, 0
+		s.appStatus.mu.Unlock()
 		s.noteAppStatus(mode, err)
 	}
 }

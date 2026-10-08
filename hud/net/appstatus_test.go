@@ -2,6 +2,7 @@ package net
 
 import (
 	"encoding/json"
+	stdnet "net"
 	"testing"
 )
 
@@ -82,21 +83,74 @@ func TestAppStatusStaysOffUnlessAsked(t *testing.T) {
 	}
 }
 
-// A dash that says STREAM_START twice must not be told twice that the mirror went live -
-// the same rule the page probe needed, for the same firmware.
+// A dash that says STREAM_START twice must not be told twice that the mirror went live - the same
+// rule the page probe needed, for the same firmware.
 func TestAppStatusSendsEachModeOnce(t *testing.T) {
 	control := NewPXCControl(":0", nil, nil)
 	control.SetAppStatusNotify(true)
-	var modes []int
-	control.OnAppStatus = func(mode int, err error) { modes = append(modes, mode) }
+	client, phone := openPhoneChannel(t, control)
+	expectAppStatus(t, control, client, phone, PxcAppStatus, AppStatusBackground)
 
 	control.SendAppStatus(AppStatusMirrorLive)
 	control.SendAppStatus(AppStatusMirrorLive)
-	control.SendAppStatus(AppStatusBackground)
+	expectAppStatus(t, control, client, phone, PxcAppStatus, AppStatusMirrorLive)
+	assertSilent(t, phone, "the phone channel after a repeated STREAM_START")
+}
 
-	if len(modes) != 2 || modes[0] != AppStatusMirrorLive || modes[1] != AppStatusBackground {
-		t.Fatalf("modes reported = %v, want one of each", modes)
+// While the host's own UI is in the phone's foreground the same statement goes out as 0x20020,
+// and a change either way restates the current mode (t0.q0, common/base/t0.java:1067-1109).
+func TestAppStatusFollowsTheHostForeground(t *testing.T) {
+	control := NewPXCControl(":0", nil, nil)
+	control.SetAppStatusNotify(true)
+	client, phone := openPhoneChannel(t, control)
+	expectAppStatus(t, control, client, phone, PxcAppStatus, AppStatusBackground)
+
+	control.SendAppStatus(AppStatusMirrorLive)
+	expectAppStatus(t, control, client, phone, PxcAppStatus, AppStatusMirrorLive)
+	go control.SetAppForeground(true)
+	expectAppStatus(t, control, client, phone, PxcAppStatusForeground, AppStatusMirrorLive)
+	go control.SetAppForeground(false)
+	expectAppStatus(t, control, client, phone, PxcAppStatus, AppStatusMirrorLive)
+}
+
+// A flavor-51 dash - CarbitRide's family, the Zontes among them - gets the official app's
+// announcements without a profile asking; any other dash does not, and the host can opt out.
+func TestAppStatusIsOnByDefaultForFlavor51Only(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		flavor string
+		optOut bool
+		want   bool
+	}{
+		{"Zontes JCDZ21, flavor 51", `51`, false, true},
+		{"flavor sent as text", `"51"`, false, true},
+		{"flavor 51, host opted out", `51`, true, false},
+		{"another flavor", `48`, false, false},
+		{"no CLIENT_INFO yet", ``, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			control := NewPXCControl(":0", nil, nil)
+			control.SetFlavor51Lifecycle(!tc.optOut)
+			if tc.flavor != "" {
+				control.HudConfig = &HUDConfig{Flavor: json.RawMessage(tc.flavor)}
+			}
+			if got := control.carbitLifecycle(); got != tc.want {
+				t.Fatalf("carbitLifecycle() = %v, want %v", got, tc.want)
+			}
+		})
 	}
+}
+
+// expectAppStatus reads the next phone command, checks it is APPSTATUS with this command and mode,
+// and acks it the way the dash does so the queue moves on.
+func expectAppStatus(t *testing.T, control *PXCControl, client, phone stdnet.Conn, cmd uint32, mode int) {
+	t.Helper()
+	got := readPXCResponse(t, phone)
+	var body struct{ Mode int }
+	if got.Command != cmd || json.Unmarshal(got.Body, &body) != nil || body.Mode != mode {
+		t.Fatalf("got 0x%x %s, want 0x%x mode %d", got.Command, got.Body, cmd, mode)
+	}
+	control.handleEvent(&PXCResponse{Command: cmd + 1}, client)
 }
 
 // decodeNumbers pulls the numeric fields out of a body that also carries booleans.
