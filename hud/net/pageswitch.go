@@ -93,20 +93,37 @@ func (s *PXCControl) SetPageSwitchProbe(enabled bool) {
 // stream, so no rider's log could have shown one. A command of ours landing where the dash
 // waits for an answer is a protocol error: a Zontes JCDZ21 hung up on 0x20030 there within
 // 18ms, five sessions out of five (MOTO-HUB issue #12).
+//
+// It is the NEWEST one. It used to be whichever a map scan met first, which after a dash
+// reopened 0x20000 could be the dead one - and CHECK_SN_RESULT written into a dead socket is
+// the QR page all over again.
 func (s *PXCControl) phoneChannel() net.Conn {
-	var found net.Conn
-	s.connections.Range(func(key, value any) bool {
-		state, ok := value.(*pxcConnectionState)
-		if !ok {
-			return true
-		}
-		if name, _ := state.channel.Load().(string); name == "CAR_DATA" {
-			found, _ = key.(net.Conn)
-			return false
-		}
-		return true
-	})
-	return found
+	s.phoneMu.Lock()
+	defer s.phoneMu.Unlock()
+	return s.phone
+}
+
+// setPhoneChannel makes conn the phone channel. A new 0x20000 replaces the old sender and
+// closes its socket in CarbitRide (sdk/z.java:117-137, a()), so the one it replaces is closed
+// here too, quietly: whatever is waiting on it gives up now instead of at its timeout.
+func (s *PXCControl) setPhoneChannel(conn net.Conn) {
+	s.phoneMu.Lock()
+	old := s.phone
+	s.phone = conn
+	s.phoneMu.Unlock()
+	if old == nil || old == conn {
+		return
+	}
+	if value, ok := s.connections.Load(old); ok {
+		value.(*pxcConnectionState).superseded.Store(true)
+	}
+	logging.Printf("PXC: the dash opened a new phone channel, closing the old one")
+	_ = old.Close()
+}
+
+func (s *PXCControl) isPhoneConn(conn net.Conn) bool {
+	name, _ := s.connectionState(conn).channel.Load().(string)
+	return name == "CAR_DATA"
 }
 
 // defaultPhoneChannelWait bounds how long CHECK_SN_RESULT waits for the phone channel.
@@ -136,18 +153,27 @@ func (s *PXCControl) sendCheckSnResult(res *PXCResponse, fallback net.Conn) {
 			case <-time.After(50 * time.Millisecond):
 			}
 		}
-		channel := "phone channel"
 		if conn == nil {
-			conn, channel = fallback, "request channel (no phone channel opened)"
-		}
-		err := s.writeResponse(res, conn, nil)
-		logging.Printf("PXC CHECK_SN_RESULT on the %s: err=%v", channel, err)
-		if err != nil {
-			s.emitError(s.connectionError(conn, PxcWriteErr, err))
+			err := s.writeResponse(res, fallback, nil)
+			s.noteCheckSnResult("request channel (no phone channel opened)", fallback, res, err)
 			return
 		}
-		s.emitEvent(*res)
+		// Through the queue, as g.java does (sdk/g.java:158-178 -> z.e), so it waits its turn
+		// behind anything in flight and the dash's 0x201C1 is matched to it.
+		note := func(conn net.Conn, err error) { s.noteCheckSnResult("phone channel", conn, res, err) }
+		if _, err := s.queueP2C(res.Command, res.Body, time.Time{}, note); err != nil {
+			note(conn, err)
+		}
 	}()
+}
+
+func (s *PXCControl) noteCheckSnResult(channel string, conn net.Conn, res *PXCResponse, err error) {
+	logging.Printf("PXC CHECK_SN_RESULT on the %s: err=%v", channel, err)
+	if err != nil {
+		s.emitError(s.connectionError(conn, PxcWriteErr, err))
+		return
+	}
+	s.emitEvent(*res)
 }
 
 // StartPageSwitchProbe runs the page sequence once, in the background. Calling it
@@ -210,7 +236,17 @@ func (s *PXCControl) runPageSwitchProbe() {
 		if s.isStopping() {
 			return
 		}
-		err := s.writeResponse(&PXCResponse{Command: step.cmd, Body: step.body}, conn, nil)
+		// Through the queue like every phone command; the step is reported as soon as it is
+		// on the wire, its ack (if any) reaches the event stream on its own.
+		written := make(chan error, 1)
+		_, err := s.queueP2C(step.cmd, step.body, time.Time{}, func(_ net.Conn, err error) { written <- err })
+		if err == nil {
+			select {
+			case <-s.quit:
+				return
+			case err = <-written:
+			}
+		}
 		logging.Printf(
 			"PXC page-switch probe: sent 0x%x bodyBytes=%d err=%v",
 			step.cmd, len(step.body), err,

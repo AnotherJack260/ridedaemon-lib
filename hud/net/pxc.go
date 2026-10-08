@@ -229,6 +229,15 @@ type PXCControl struct {
 	// wire, so a rider's log carries the mode and whether the write landed. The dash's
 	// own 0x20031 ack arrives separately, through the unhandled-response branch.
 	OnAppStatus func(mode int, err error)
+
+	// The phone channel and its one sender; see p2c.go and phoneChannel.
+	phoneMu    sync.Mutex
+	phone      net.Conn
+	p2cOnce    sync.Once
+	p2cQueue   chan *p2cRequest
+	p2cReplies chan p2cFrame
+	// p2cTimeout is the dash's own reply timeout, from CLIENT_INFO; zero until it says.
+	p2cTimeout atomic.Int64
 }
 
 type pxcConnectionState struct {
@@ -243,6 +252,9 @@ type pxcConnectionState struct {
 	channel     atomic.Value // string: "CAR_CTRL" | "CAR_DATA"
 	lastRxNanos atomic.Int64
 	beatsSince  atomic.Int64 // keepalives written since the dash last said anything
+	// superseded marks a phone channel the dash replaced with a newer one, so its closing is
+	// not reported as a failure.
+	superseded atomic.Bool
 }
 
 func NewPXCControl(port string, kp *KeyPair, config *PhoneConfig) *PXCControl {
@@ -254,6 +266,8 @@ func NewPXCControl(port string, kp *KeyPair, config *PhoneConfig) *PXCControl {
 		Errors:      make(chan error, 16),
 		KeyPair:     kp,
 		PhoneConfig: config,
+		p2cQueue:    make(chan *p2cRequest, p2cQueueSize),
+		p2cReplies:  make(chan p2cFrame, 8),
 	}
 }
 
@@ -449,6 +463,11 @@ func (s *PXCControl) releaseConnectionState(conn net.Conn) {
 	}
 	state := value.(*pxcConnectionState)
 	state.doneOnce.Do(func() { close(state.done) })
+	s.phoneMu.Lock()
+	if s.phone == conn {
+		s.phone = nil
+	}
+	s.phoneMu.Unlock()
 }
 
 func (s *PXCControl) heartbeatEvery() time.Duration {
@@ -661,6 +680,9 @@ func (s *PXCControl) startChannelHeartbeat(conn net.Conn, channel string) {
 }
 
 func (s *PXCControl) handleEvent(event *PXCResponse, conn net.Conn) {
+	if pxcIsReply(event.Command) && s.isPhoneConn(conn) {
+		s.deliverP2CReply(conn, event)
+	}
 	switch event.Command {
 	case PxcHandshake:
 		// Named before it is answered, not after: a write that fails here produces an error whose
@@ -684,6 +706,8 @@ func (s *PXCControl) handleEvent(event *PXCResponse, conn net.Conn) {
 			s.emitError(s.connectionError(conn, PxcWriteErr, err))
 			return
 		}
+		s.setPhoneChannel(conn)
+		s.startP2C()
 		s.startChannelHeartbeat(conn, "CAR_DATA")
 		// The official app's first APPSTATUS goes out as soon as this channel is up
 		// (b0.r -> ec/v -> t0.q0), before any capture is negotiated.
@@ -762,6 +786,11 @@ func (s *PXCControl) handleEvent(event *PXCResponse, conn net.Conn) {
 		}
 	case PxcCheckSnDone:
 		// The bike acknowledges the phone-originated CHECK_SN_RESULT.
+		s.emitEvent(*event)
+	case PxcStatusUnsupported, PxcStatusError:
+		// Even, but answers to something the phone sent (sdk/x0.java:133-140): acking one
+		// would be answering an answer.
+		logging.Printf("PXC status reply command=0x%x bodyBytes=%d", event.Command, len(event.Body))
 		s.emitEvent(*event)
 	case PxcHuTimeSync:
 		// Same shape as the default even-command branch - emit, then ACK with
@@ -901,7 +930,7 @@ func (s *PXCControl) handleConn(conn net.Conn) {
 		// Read the 16 byte header
 		headerBytes := make([]byte, pxcHeaderSize)
 		if n, err := io.ReadFull(reader, headerBytes); err != nil {
-			if s.isStopping() {
+			if s.isStopping() || state.superseded.Load() {
 				return
 			}
 			fail(PxcDecodeErr, fmt.Errorf("error reading header: %v (read %d bytes: %x)", err, n, headerBytes[:n]))
@@ -926,7 +955,7 @@ func (s *PXCControl) handleConn(conn net.Conn) {
 		if request.Size > 0 {
 			payload = make([]byte, request.Size-pxcHeaderSize)
 			if _, err := io.ReadFull(reader, payload); err != nil {
-				if s.isStopping() {
+				if s.isStopping() || state.superseded.Load() {
 					return
 				}
 				fail(PxcDecodeErr, fmt.Errorf("[PXCService] read payload failed from %s: %v", conn.RemoteAddr(), err))

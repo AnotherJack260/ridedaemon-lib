@@ -3,7 +3,9 @@ package net
 import (
 	"encoding/json"
 	"fmt"
+	"net"
 	"sync"
+	"time"
 
 	"github.com/charliecharlieO-o/ridedaemon-go/internal/logging"
 )
@@ -151,15 +153,6 @@ func (s *PXCControl) SendAppStatus(mode int) {
 		return
 	}
 
-	// No fallback: CarbitRide's t0.q0 returns early when its P2C socket is down, and the
-	// request channel is where a Zontes hung up on this command (issue #12).
-	conn := s.phoneChannel()
-	if conn == nil {
-		logging.Printf("PXC app status: the dash has not opened the phone channel to send mode=%d on", mode)
-		s.noteAppStatus(mode, fmt.Errorf("the dash has not opened the phone channel (0x20000)"))
-		return
-	}
-
 	body, err := buildAppStatusBody(screen, mode)
 	if err != nil {
 		s.emitError(&PxcError{PxcWriteErr, fmt.Errorf("encode APPSTATUS_BACKGROUND: %w", err), true})
@@ -167,11 +160,19 @@ func (s *PXCControl) SendAppStatus(mode int) {
 		return
 	}
 
-	err = s.writeResponse(&PXCResponse{Command: PxcAppStatus, Body: body}, conn, nil)
-	logging.Printf("PXC app status: sent 0x%x mode=%d body=%s err=%v", PxcAppStatus, mode, body, err)
-	s.noteAppStatus(mode, err)
+	// Phone channel only, through the queue (see p2c.go). No fallback: CarbitRide's t0.q0
+	// returns early when its P2C socket is down, and the request channel is where a Zontes
+	// hung up on this command (issue #12).
+	_, err = s.queueP2C(PxcAppStatus, body, time.Time{}, func(conn net.Conn, err error) {
+		logging.Printf("PXC app status: sent 0x%x mode=%d body=%s err=%v", PxcAppStatus, mode, body, err)
+		s.noteAppStatus(mode, err)
+		if err != nil && conn != nil {
+			s.emitError(s.connectionError(conn, PxcWriteErr, err))
+		}
+	})
 	if err != nil {
-		s.emitError(s.connectionError(conn, PxcWriteErr, err))
+		logging.Printf("PXC app status: mode=%d not sent: %v", mode, err)
+		s.noteAppStatus(mode, err)
 	}
 }
 

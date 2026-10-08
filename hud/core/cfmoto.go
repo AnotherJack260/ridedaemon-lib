@@ -667,6 +667,18 @@ func (hud *CfmotoHUD) StopStream(ctx context.Context) error {
 	return nil
 }
 
+// SendPhoneCommand sends one phone-originated PXC command on the phone channel and returns
+// the dash's answer. See net.PXCControl.SendPhoneCommand.
+func (hud *CfmotoHUD) SendPhoneCommand(cmd uint32, body []byte, timeout time.Duration) (*net.PXCResponse, error) {
+	hud.mu.Lock()
+	pxc := hud.pxcControl
+	hud.mu.Unlock()
+	if pxc == nil {
+		return nil, errors.New("the session is not running")
+	}
+	return pxc.SendPhoneCommand(cmd, body, timeout)
+}
+
 func (hud *CfmotoHUD) IsRunning() bool {
 	hud.mu.Lock()
 	defer hud.mu.Unlock()

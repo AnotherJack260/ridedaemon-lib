@@ -54,10 +54,13 @@ func TestPageSwitchProbeSendsTheThreeCommandsInOrder(t *testing.T) {
 		steps <- step
 	}
 
-	_, server := openPhoneChannel(t, control)
+	client, server := openPhoneChannel(t, control)
 	control.StartPageSwitchProbe()
 
+	// The probe goes through the phone command queue, which sends the next command only
+	// once the dash has answered the last one; this dash answers each.
 	first := readPXCResponse(t, server)
+	dashAnswers(control, client, first)
 	if first.Command != PxcPageStatus {
 		t.Fatalf("first probe command = 0x%x, want 0x%x (PAGE_STATUS)", first.Command, PxcPageStatus)
 	}
@@ -74,6 +77,7 @@ func TestPageSwitchProbeSendsTheThreeCommandsInOrder(t *testing.T) {
 	}
 
 	second := readPXCResponse(t, server)
+	dashAnswers(control, client, second)
 	if second.Command != PxcJumpToCarPage {
 		t.Fatalf("second probe command = 0x%x, want 0x%x (JUMP_TO_CAR_PAGE)", second.Command, PxcJumpToCarPage)
 	}
@@ -114,12 +118,12 @@ func TestPageSwitchProbeRunsOncePerSession(t *testing.T) {
 	control.SetPageSwitchProbe(true)
 	control.pageProbeSpacing = time.Millisecond
 
-	_, server := openPhoneChannel(t, control)
+	client, server := openPhoneChannel(t, control)
 	control.StartPageSwitchProbe()
 	control.StartPageSwitchProbe()
 
 	for i := 0; i < 3; i++ {
-		readPXCResponse(t, server)
+		dashAnswers(control, client, readPXCResponse(t, server))
 	}
 	if err := server.SetReadDeadline(time.Now().Add(100 * time.Millisecond)); err != nil {
 		t.Fatal(err)
@@ -178,4 +182,10 @@ func nextStep(t *testing.T, steps <-chan PageSwitchProbeStep) PageSwitchProbeSte
 		t.Fatal("probe reported no further step")
 		return 0
 	}
+}
+
+// dashAnswers delivers the dash's cmd+1 for a command it read, the way the connection's reader
+// would.
+func dashAnswers(control *PXCControl, conn stdnet.Conn, command PXCResponse) {
+	control.handleEvent(&PXCResponse{Command: command.Command + 1}, conn)
 }

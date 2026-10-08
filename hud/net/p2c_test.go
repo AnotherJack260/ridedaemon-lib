@@ -2,6 +2,7 @@ package net
 
 import (
 	"encoding/json"
+	"errors"
 	stdnet "net"
 	"testing"
 	"time"
@@ -18,9 +19,20 @@ func openPhoneChannel(t *testing.T, control *PXCControl) (client, server stdnet.
 	if err := server.SetDeadline(time.Now().Add(2 * time.Second)); err != nil {
 		t.Fatal(err)
 	}
-	go control.handleEvent(&PXCResponse{Command: PxcChannelCarData}, client)
+	handled := make(chan struct{})
+	go func() {
+		control.handleEvent(&PXCResponse{Command: PxcChannelCarData}, client)
+		close(handled)
+	}()
 	if got := readPXCResponse(t, server); got.Command != PxcChannelCarData+1 {
 		t.Fatalf("phone channel reply = 0x%x, want 0x%x", got.Command, PxcChannelCarData+1)
+	}
+	// The channel becomes the phone channel after its ack is on the wire, so nothing queued
+	// can overtake the ack; wait for that before handing it to the test.
+	select {
+	case <-handled:
+	case <-time.After(time.Second):
+		t.Fatal("phone channel opening did not complete")
 	}
 	return client, server
 }
@@ -33,6 +45,8 @@ func assertSilent(t *testing.T, conn stdnet.Conn, what string) {
 	if _, err := conn.Read(make([]byte, 1)); err == nil {
 		t.Fatalf("%s: something was written here", what)
 	}
+	// Later reads in the same test get the usual budget back.
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 }
 
 // Issue #12: a Zontes JCDZ21 hung up 18ms after 0x20030 arrived on the connection it was
@@ -132,5 +146,184 @@ func TestChannelOpeningsReachTheEventStream(t *testing.T) {
 	}
 	if !seen[PxcHandshake] || !seen[PxcChannelCarData] {
 		t.Fatalf("events = %v, want both 0x%x and 0x%x", seen, PxcHandshake, PxcChannelCarData)
+	}
+}
+
+// sendAsync runs SendPhoneCommand off the test goroutine, since it blocks for the answer.
+func sendAsync(control *PXCControl, cmd uint32, body []byte, timeout time.Duration) <-chan p2cResult {
+	out := make(chan p2cResult, 1)
+	go func() {
+		reply, err := control.SendPhoneCommand(cmd, body, timeout)
+		out <- p2cResult{reply: reply, err: err}
+	}()
+	return out
+}
+
+func awaitResult(t *testing.T, results <-chan p2cResult) p2cResult {
+	t.Helper()
+	select {
+	case r := <-results:
+		return r
+	case <-time.After(2 * time.Second):
+		t.Fatal("SendPhoneCommand never returned")
+		return p2cResult{}
+	}
+}
+
+// The dash's answer comes back to the caller, whichever answer it is (x0.b(), x0.java:126-140),
+// and the command never touches the dash's request channel.
+func TestPhoneCommandReturnsTheDashAnswer(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		reply PXCResponse
+	}{
+		{"ack with body", PXCResponse{Command: 0x20111, Body: []byte(`{"ok":1}`)}},
+		{"empty ack", PXCResponse{Command: 0x20111}},
+		{"unsupported", PXCResponse{Command: PxcStatusUnsupported}},
+		{"error", PXCResponse{Command: PxcStatusError}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			control := NewPXCControl(":0", nil, nil)
+			_, request := openControlChannel(t, control)
+			client, phone := openPhoneChannel(t, control)
+
+			results := sendAsync(control, 0x20110, []byte(`{"status":0}`), 0)
+			got := readPXCResponse(t, phone)
+			if got.Command != 0x20110 || string(got.Body) != `{"status":0}` {
+				t.Fatalf("on the phone channel: 0x%x %s", got.Command, got.Body)
+			}
+			reply := tc.reply
+			control.handleEvent(&reply, client)
+
+			r := awaitResult(t, results)
+			if r.err != nil || r.reply == nil || r.reply.Command != tc.reply.Command ||
+				string(r.reply.Body) != string(tc.reply.Body) {
+				t.Fatalf("result = %+v, %v; want %+v", r.reply, r.err, tc.reply)
+			}
+			assertSilent(t, request, "the dash's request channel")
+			// A status reply is an answer: acking it would answer an answer.
+			assertSilent(t, phone, "the phone channel after the answer")
+		})
+	}
+}
+
+// One command at a time: the next waits for the answer to the last (x0.java:225-235).
+func TestPhoneCommandsGoOutOneAtATime(t *testing.T) {
+	control := NewPXCControl(":0", nil, nil)
+	client, phone := openPhoneChannel(t, control)
+
+	first := sendAsync(control, 0x20110, nil, 0)
+	if got := readPXCResponse(t, phone); got.Command != 0x20110 {
+		t.Fatalf("first = 0x%x", got.Command)
+	}
+	second := sendAsync(control, 0x201E0, nil, 0)
+	assertSilent(t, phone, "the phone channel before the first answer")
+
+	// A late or stray answer to something else does not release the queue.
+	control.handleEvent(&PXCResponse{Command: 0x201E1}, client)
+	assertSilent(t, phone, "the phone channel after a stray answer")
+
+	control.handleEvent(&PXCResponse{Command: 0x20111}, client)
+	if r := awaitResult(t, first); r.err != nil || r.reply.Command != 0x20111 {
+		t.Fatalf("first result = %+v, %v", r.reply, r.err)
+	}
+	if got := readPXCResponse(t, phone); got.Command != 0x201E0 {
+		t.Fatalf("second = 0x%x", got.Command)
+	}
+	control.handleEvent(&PXCResponse{Command: 0x201E1}, client)
+	if r := awaitResult(t, second); r.err != nil || r.reply.Command != 0x201E1 {
+		t.Fatalf("second result = %+v, %v", r.reply, r.err)
+	}
+}
+
+// CarbitRide drops a command when there is no P2C sender (z.java:188-202); it never falls
+// back to the request channel, where a Zontes hangs up on a command (issue #12).
+func TestPhoneCommandWithoutPhoneChannelIsRefused(t *testing.T) {
+	control := NewPXCControl(":0", nil, nil)
+	_, request := openControlChannel(t, control)
+
+	_, err := control.SendPhoneCommand(0x20110, nil, 0)
+	if !errors.Is(err, ErrNoPhoneChannel) {
+		t.Fatalf("err = %v, want ErrNoPhoneChannel", err)
+	}
+	assertSilent(t, request, "the dash's request channel")
+}
+
+func TestPhoneCommandTimesOutOnTheDashTimeout(t *testing.T) {
+	control := NewPXCControl(":0", nil, nil)
+	control.p2cTimeout.Store(int64(50 * time.Millisecond))
+	_, phone := openPhoneChannel(t, control)
+
+	results := sendAsync(control, 0x20110, nil, 0)
+	readPXCResponse(t, phone)
+	if r := awaitResult(t, results); !errors.Is(r.err, ErrPhoneCommandTimeout) {
+		t.Fatalf("err = %v, want ErrPhoneCommandTimeout", r.err)
+	}
+	// The queue moves on.
+	next := sendAsync(control, 0x201E0, nil, 0)
+	if got := readPXCResponse(t, phone); got.Command != 0x201E0 {
+		t.Fatalf("next = 0x%x", got.Command)
+	}
+	awaitResult(t, next)
+}
+
+// A caller that gives up while its command is still queued must not have it sent later.
+func TestAnExpiredQueuedCommandIsNeverSent(t *testing.T) {
+	control := NewPXCControl(":0", nil, nil)
+	client, phone := openPhoneChannel(t, control)
+
+	first := sendAsync(control, 0x20110, nil, 0)
+	readPXCResponse(t, phone)
+	stale := sendAsync(control, 0x201E0, nil, 20*time.Millisecond)
+	if r := awaitResult(t, stale); !errors.Is(r.err, ErrPhoneCommandTimeout) {
+		t.Fatalf("stale err = %v", r.err)
+	}
+	control.handleEvent(&PXCResponse{Command: 0x20111}, client)
+	awaitResult(t, first)
+	assertSilent(t, phone, "the phone channel after the caller gave up")
+}
+
+// z0.getResponseProcessType() (z0.java:44-47) and its None overrides: the dash owes these no
+// answer, so nothing waits for one.
+func TestCommandsTheDashOwesNoAnswer(t *testing.T) {
+	for cmd, want := range map[uint32]bool{
+		0x40010: true, 0x30020: true, 0x30030: true, 0x30040: true,
+		0x1060020: true, 0x1060030: true, 0x1090020: true,
+		0x60000000: true, 0x60000050: true, 0x60030050: true,
+		PxcStatusUnsupported: true, PxcStatusError: true, 0x80000030: true, 0x70000020: true,
+		PxcHeartbeat: false, PxcCheckSnResult: false, PxcAppStatus: false, 0x20110: false,
+	} {
+		if got := p2cNoReply(cmd); got != want {
+			t.Errorf("p2cNoReply(0x%x) = %v, want %v", cmd, got, want)
+		}
+	}
+
+	control := NewPXCControl(":0", nil, nil)
+	_, phone := openPhoneChannel(t, control)
+	results := sendAsync(control, 0x60000050, []byte{1}, 0)
+	readPXCResponse(t, phone)
+	if r := awaitResult(t, results); r.err != nil || r.reply != nil {
+		t.Fatalf("result = %+v, %v; want nil, nil", r.reply, r.err)
+	}
+}
+
+// After a Wi-Fi blip the dash opens 0x20000 again. Commands go on the new one, and the old one
+// is closed the way CarbitRide replaces its sender (z.java:117-137) - it used to be whichever a
+// map scan met first, which could be the dead one.
+func TestTheNewestPhoneChannelWins(t *testing.T) {
+	control := NewPXCControl(":0", nil, nil)
+	oldClient, oldPhone := openPhoneChannel(t, control)
+	_, newPhone := openPhoneChannel(t, control)
+
+	if _, err := oldPhone.Read(make([]byte, 1)); err == nil {
+		t.Fatal("the replaced phone channel was not closed")
+	}
+	if value, _ := control.connections.Load(oldClient); !value.(*pxcConnectionState).superseded.Load() {
+		t.Fatal("the replaced phone channel is not marked superseded, so its close reads as a failure")
+	}
+
+	sendAsync(control, 0x20110, nil, 0)
+	if got := readPXCResponse(t, newPhone); got.Command != 0x20110 {
+		t.Fatalf("on the new phone channel: 0x%x", got.Command)
 	}
 }

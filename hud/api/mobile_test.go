@@ -83,3 +83,16 @@ func TestRelayEventStillCopiesPlainByteSlicePayload(t *testing.T) {
 		t.Fatal("media control event payload was not relayed")
 	}
 }
+
+// Before the dash has completed the handshake there is no phone channel to send on; the call
+// must say so rather than block or panic.
+func TestSendPhoneCommandBeforeTheSessionRunsIsAnError(t *testing.T) {
+	session, err := NewMobileSession(NewMobileConfig(nil, 30, 10, 5, 10, 3), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.StopSession()
+	if reply, err := session.SendPhoneCommand(0x20110, []byte(`{}`), 100); err == nil || reply != nil {
+		t.Fatalf("SendPhoneCommand = %+v, %v; want an error", reply, err)
+	}
+}

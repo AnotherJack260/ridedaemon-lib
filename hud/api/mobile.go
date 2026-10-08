@@ -440,6 +440,34 @@ func (ms *MobileSession) PushStill(jpeg []byte) {
 	ms.mux.Live.PushFrame(jpeg)
 }
 
+// PhoneCommandReply is the dash's answer to a phone command: its cmd+1 with whatever body it
+// carried, or 0x80000010 (unsupported) / 0x80000020 (error) when the dash refused it.
+// Command is an int64 so 0x8xxxxxxx reads the same on every ABI.
+type PhoneCommandReply struct {
+	Command int64
+	Body    []byte
+}
+
+// SendPhoneCommand sends one phone-originated PXC command (a P2C command such as 0x20110) to
+// the dash, on the connection it opened for them (0x20000), and blocks until the dash answers.
+// Commands go out one at a time, each after the previous one has been answered, the way the
+// official app sends them; the dash's answers also reach OnEvent as usual.
+//
+// The wait for the answer is the dash's own timeout (socketTimeoutPeriodWifi, else 9 s).
+// timeoutMs > 0 additionally bounds the whole call, time spent queued included; a command
+// still queued when it expires is never sent. Returns null without error for the few commands
+// the dash owes no answer to. Errors when the dash has not opened the channel, the write
+// fails, nothing comes back in time, or the session stops. Call it off the main thread.
+func (ms *MobileSession) SendPhoneCommand(command int64, body []byte, timeoutMs int) (*PhoneCommandReply, error) {
+	reply, err := ms.hud.SendPhoneCommand(
+		uint32(command), append([]byte(nil), body...), time.Duration(timeoutMs)*time.Millisecond,
+	)
+	if err != nil || reply == nil {
+		return nil, err
+	}
+	return &PhoneCommandReply{Command: int64(reply.Command), Body: append([]byte(nil), reply.Body...)}, nil
+}
+
 func (ms *MobileSession) IsRunning() bool {
 	select {
 	case <-ms.stopped:
