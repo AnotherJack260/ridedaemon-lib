@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"reflect"
 	"strconv"
 	"strings"
@@ -513,6 +514,8 @@ type pxcConnectionState struct {
 	// newer one, or one whose TLS switch failed and was reported - so its closing is not reported
 	// as a failure.
 	superseded atomic.Bool
+	// retired is why this side closed the connection (retire); its read loop reports that.
+	retired atomic.Pointer[error]
 	// reader is the connection's buffered reader, owned by its read loop; a TLS switch takes over
 	// what it has buffered.
 	reader *bufio.Reader
@@ -798,6 +801,25 @@ func (s *PXCControl) releaseConnectionState(conn net.Conn) {
 	s.phoneMu.Unlock()
 }
 
+// retire closes a connection this side can no longer trust: a write the dash did not take within
+// its own timeout, or a phone command it left unanswered that long, after which a late answer could
+// be taken for the next command's (PXC has no transaction ids). A retired phone channel stops being
+// the phone channel at once, and the dash opens a new one as it does after a Wi-Fi blip. Otherwise
+// it goes the way a dead connection goes: its read loop ends and reports it through connectionError,
+// fatal only when nothing else serves the dash, with cause in place of the socket's complaint.
+func (s *PXCControl) retire(conn net.Conn, cause error) {
+	if !s.connectionState(conn).retired.CompareAndSwap(nil, &cause) {
+		return
+	}
+	s.phoneMu.Lock()
+	if s.phone == conn {
+		s.phone = nil
+	}
+	s.phoneMu.Unlock()
+	logging.Printf("PXC: closing a connection: %v", cause)
+	_ = conn.Close()
+}
+
 func (s *PXCControl) heartbeatEvery() time.Duration {
 	if s.heartbeatInterval > 0 {
 		return s.heartbeatInterval
@@ -935,16 +957,25 @@ func (s *PXCControl) writeResponse(res *PXCResponse, conn net.Conn, raw *[]byte)
 	state.writeMu.Lock()
 	defer state.writeMu.Unlock()
 
+	var frame []byte
 	if raw == nil && res != nil {
-		if _, err := conn.Write(encodeFrame(res)); err != nil {
-			return err
-		}
+		frame = encodeFrame(res)
 	} else if raw != nil {
-		if _, err := conn.Write(*raw); err != nil {
-			return err
-		}
+		frame = *raw
+	} else {
+		return nil
 	}
-
+	// Bounded by the dash's own timeout: a dash that stops reading would otherwise hold this lock,
+	// and the phone command queue behind it, for as long as the socket lives. A frame cut short
+	// leaves nothing worth keeping on the socket, so it is retired.
+	timeout := s.p2cReplyTimeout()
+	_ = conn.SetWriteDeadline(time.Now().Add(timeout))
+	if _, err := conn.Write(frame); err != nil {
+		if errors.Is(err, os.ErrDeadlineExceeded) {
+			s.retire(conn, fmt.Errorf("the dash took nothing written to it for %s: %w", timeout, err))
+		}
+		return err
+	}
 	return nil
 }
 
@@ -1334,6 +1365,9 @@ func (s *PXCControl) handleConn(conn net.Conn) {
 	// first and removing afterwards lets two dying channels each see the other
 	// still listed and call a real death survivable.
 	fail := func(errType PxcErrorType, cause error) {
+		if retired := state.retired.Load(); retired != nil {
+			errType, cause = PxcTimeoutErr, *retired
+		}
 		s.tracker.Remove(conn)
 		s.emitError(s.connectionError(conn, errType, cause))
 	}

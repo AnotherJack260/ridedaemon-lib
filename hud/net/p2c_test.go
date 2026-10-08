@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	stdnet "net"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -262,12 +263,96 @@ func TestPhoneCommandTimesOutOnTheDashTimeout(t *testing.T) {
 	if r := awaitResult(t, results); !errors.Is(r.err, ErrPhoneCommandTimeout) {
 		t.Fatalf("err = %v, want ErrPhoneCommandTimeout", r.err)
 	}
-	// The queue moves on.
-	next := sendAsync(control, 0x201E0, nil, 0)
-	if got := readPXCResponse(t, phone); got.Command != 0x201E0 {
-		t.Fatalf("next = 0x%x", got.Command)
+	// The queue moves on, without the channel a late answer could still arrive on.
+	if r := awaitResult(t, sendAsync(control, 0x201E0, nil, 0)); !errors.Is(r.err, ErrNoPhoneChannel) {
+		t.Fatalf("next err = %v, want ErrNoPhoneChannel", r.err)
 	}
-	awaitResult(t, next)
+	if _, err := phone.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+		t.Fatalf("the unanswered phone channel was left open: %v", err)
+	}
+}
+
+// A dash that stops reading its phone channel: the write is bounded by the dash's own timeout and
+// the channel is retired, so the commands queued behind it fail at once instead of freezing.
+func TestABlockedPhoneChannelWriteRetiresTheChannel(t *testing.T) {
+	control := NewPXCControl(":0", nil, nil)
+	control.p2cTimeout.Store(int64(50 * time.Millisecond))
+	_, phone := openPhoneChannel(t, control) // never read again
+
+	stuck, err := control.queueP2C(PxcCheckSnResult, []byte(`{"isOk":true}`), time.Time{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	behind, err := control.queueP2C(PxcAppStatus, nil, time.Time{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, req := range map[string]*p2cRequest{"the blocked write": stuck, "the command behind it": behind} {
+		select {
+		case r := <-req.done:
+			if want := map[*p2cRequest]error{stuck: os.ErrDeadlineExceeded, behind: ErrNoPhoneChannel}[req]; !errors.Is(r.err, want) {
+				t.Fatalf("%s: err = %v, want %v", name, r.err, want)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("%s never finished: the queue froze behind a dash that stopped reading", name)
+		}
+	}
+	if control.phoneChannel() != nil {
+		t.Fatal("the blocked phone channel is still the phone channel")
+	}
+	_ = phone.SetReadDeadline(time.Now().Add(time.Second))
+	if _, err := io.ReadAll(phone); err != nil {
+		t.Fatalf("the blocked phone channel was not closed: %v", err)
+	}
+}
+
+// PXC has no transaction ids: once a command has gone unanswered for the dash's own timeout, its
+// answer can still come and be taken for the next command's. The phone channel is retired instead,
+// reported as one channel closed while the request channel serves on, and commands go out again on
+// the channel the dash opens next.
+func TestAnUnansweredPhoneCommandRetiresThePhoneChannel(t *testing.T) {
+	control := NewPXCControl(":0", nil, nil)
+	control.p2cTimeout.Store(int64(50 * time.Millisecond))
+	open := func(cmd uint32) stdnet.Conn {
+		car, dash := stdnet.Pipe()
+		t.Cleanup(func() { _ = car.Close(); _ = dash.Close() })
+		_ = dash.SetDeadline(time.Now().Add(3 * time.Second))
+		servePXCConn(t, control, car)
+		writeDashFrame(t, dash, cmd, nil)
+		if got := readPXCResponse(t, dash); got.Command != cmd+1 {
+			t.Fatalf("0x%x answered 0x%x", cmd, got.Command)
+		}
+		return dash
+	}
+	open(PxcHandshake)
+	data := open(PxcChannelCarData)
+	waitForPhoneChannel(t, control, nil)
+
+	results := sendAsync(control, 0x20110, nil, 0)
+	readPXCResponse(t, data) // never answered
+	if r := awaitResult(t, results); !errors.Is(r.err, ErrPhoneCommandTimeout) {
+		t.Fatalf("err = %v, want ErrPhoneCommandTimeout", r.err)
+	}
+	if err := readPXCError(t, control); err.IsFatal() || !strings.Contains(err.Error(), "no answer to 0x20110") {
+		t.Fatalf("retirement reported as %v", err)
+	}
+	if _, err := data.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+		t.Fatalf("the phone channel was left open for a late answer: %v", err)
+	}
+	if _, err := control.SendPhoneCommand(0x201E0, nil, 0); !errors.Is(err, ErrNoPhoneChannel) {
+		t.Fatalf("err = %v, want ErrNoPhoneChannel", err)
+	}
+
+	reopened := open(PxcChannelCarData)
+	waitForPhoneChannel(t, control, nil)
+	results = sendAsync(control, 0x201E0, nil, 0)
+	if got := readPXCResponse(t, reopened); got.Command != 0x201E0 {
+		t.Fatalf("on the reopened phone channel: 0x%x", got.Command)
+	}
+	writeDashFrame(t, reopened, 0x201E1, nil)
+	if r := awaitResult(t, results); r.err != nil || r.reply.Command != 0x201E1 {
+		t.Fatalf("result = %+v, %v", r.reply, r.err)
+	}
 }
 
 // A caller that gives up while its command is still queued must not have it sent later.

@@ -101,7 +101,9 @@ type p2cFrame struct {
 // The wait for the answer is the dash's own (socketTimeoutPeriodWifi, else 9 s). timeout, when
 // positive, bounds the whole call including the time spent queued; a command still queued
 // when it expires is never sent. One already on the wire keeps the queue until its answer or
-// the dash's timeout, as CarbitRide's does.
+// the dash's timeout, as CarbitRide's does; its write is bounded by that timeout too. A command
+// that misses it, in the write or the answer, retires the phone channel (retire): the commands
+// behind it fail with ErrNoPhoneChannel until the dash opens a new one.
 func (s *PXCControl) SendPhoneCommand(cmd uint32, body []byte, timeout time.Duration) (*PXCResponse, error) {
 	var deadline time.Time
 	var expired <-chan time.Time
@@ -294,6 +296,11 @@ func (s *PXCControl) p2cExchange(cmd uint32, body []byte, onWritten func(net.Con
 			return nil, errors.New("the phone channel closed before the dash answered")
 		case <-timer.C:
 			s.judgeSilentDash(state, cmd, timeout)
+			// The answer may still come, and with no transaction ids it would be taken for the
+			// next command's. CarbitRide ends the whole session here (see judgeSilentDash); this
+			// retires only the channel, which the dash reopens. A dash that answers within its own
+			// timeout - every one seen, the Zontes included - never gets here.
+			s.retire(conn, fmt.Errorf("no answer to 0x%x on the phone channel within %s", cmd, timeout))
 			return nil, fmt.Errorf("%w within %s", ErrPhoneCommandTimeout, timeout)
 		case frame := <-s.p2cReplies:
 			if frame.conn != conn {

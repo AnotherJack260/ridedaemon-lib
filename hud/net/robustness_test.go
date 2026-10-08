@@ -157,6 +157,7 @@ func (c *countingConn) Write(b []byte) (int, error) {
 	c.writes = append(c.writes, append([]byte(nil), b...))
 	return len(b), nil
 }
+func (c *countingConn) SetWriteDeadline(time.Time) error { return nil }
 
 // One frame, one write, as the official app flushes it (sdk/i.java:149-163). Four header
 // writes on a TCP_NODELAY socket went out as four segments.
