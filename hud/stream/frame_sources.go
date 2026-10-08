@@ -198,6 +198,13 @@ func (s *FileFrameSource) NextFrame(now time.Time) ([]byte, error) {
 	return nil, nil
 }
 
+// Rewind starts the replay over, stream header first, for a session that starts again.
+func (s *FileFrameSource) Rewind() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.replayIdx, s.pollCount, s.lastAu, s.lastAdvance = 0, 0, nil, time.Time{}
+}
+
 type RawFrameSource struct {
 	FileFrameSource
 }
@@ -318,6 +325,17 @@ func (s *LiveStreamSource) SetOpaquePayloads(enabled bool) {
 		s.opaque = enabled
 		s.clearLocked()
 	}
+}
+
+// Reset returns the source to how NewLiveStreamSource left it, then SetOpaquePayloads(opaque), for
+// a session that starts again: nothing queued or kept for a repeat, no mode the last run negotiated.
+func (s *LiveStreamSource) Reset(opaque bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.opaque, s.polled = opaque, false
+	s.clearLocked()
+	s.active, s.lastInput = false, time.Time{}
+	s.lastKeyframeAsk, s.keyframeOwed, s.owedDropped = time.Time{}, false, 0
 }
 
 // SetPollMode deepens the H.264 queue to pollQueueAUs for a dash that polls for each frame, or

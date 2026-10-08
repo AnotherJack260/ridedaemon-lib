@@ -91,11 +91,17 @@ type MCULite struct {
 
 func NewMCULite() *MCULite { return &MCULite{} }
 
-// SetMCULite makes this server answer the MCU-Lite family. Configure it before Start.
+// SetMCULite makes this server answer the MCU-Lite family. Configure it before Start. Each run
+// has a server of its own, so m forgets what the last one negotiated and was handed; the host's
+// callbacks stay.
 func (s *PXCControl) SetMCULite(m *MCULite) {
 	s.mcuLite = m
 	if m != nil {
+		m.mu.Lock()
 		m.pxc = s
+		m.ctrl, m.phone, m.data, m.token, m.support, m.mirror = nil, nil, nil, 0, 0, nil
+		m.jpeg, m.gps, m.weather = nil, nil, nil
+		m.mu.Unlock()
 	}
 }
 
@@ -135,11 +141,11 @@ func (m *MCULite) answer(s *PXCControl, event *PXCResponse, conn net.Conn) *PXCR
 	switch event.Command {
 	case MCULiteChannelC2P:
 		// "close all" before a new session (h0.java:369-373): the old channels and the data.
-		m.replace(&m.ctrl, conn, true)
+		m.replace(s, &m.ctrl, conn, true)
 		m.watch(s, conn, "MCU_LITE_C2P")
 		return ack
 	case MCULiteChannelP2C:
-		m.replace(&m.phone, conn, false) // z.B(): a new phone channel replaces the old one
+		m.replace(s, &m.phone, conn, false) // z.B(): a new phone channel replaces the old one
 		m.watch(s, conn, "MCU_LITE_P2C")
 		return ack
 	case MCULiteCmdClientInfo:
@@ -182,7 +188,7 @@ func (m *MCULite) answer(s *PXCControl, event *PXCResponse, conn net.Conn) *PXCR
 
 // replace puts conn in slot, closing what it held; all also closes the other channels and the
 // data socket. Whatever is closed here was replaced, so its closing is not a failure.
-func (m *MCULite) replace(slot *net.Conn, conn net.Conn, all bool) {
+func (m *MCULite) replace(s *PXCControl, slot *net.Conn, conn net.Conn, all bool) {
 	m.mu.Lock()
 	old := []net.Conn{*slot}
 	if all {
@@ -193,13 +199,13 @@ func (m *MCULite) replace(slot *net.Conn, conn net.Conn, all bool) {
 	m.mu.Unlock()
 	for _, c := range old {
 		if c != nil && c != conn {
-			m.quietClose(c)
+			m.quietClose(s, c)
 		}
 	}
 }
 
-func (m *MCULite) quietClose(c net.Conn) {
-	if value, ok := m.pxc.connections.Load(c); ok {
+func (m *MCULite) quietClose(s *PXCControl, c net.Conn) {
+	if value, ok := s.connections.Load(c); ok {
 		value.(*pxcConnectionState).superseded.Store(true)
 	}
 	_ = c.Close()
@@ -221,16 +227,18 @@ func (m *MCULite) watch(s *PXCControl, conn net.Conn, name string) {
 		defer s.wg.Done()
 		select {
 		case <-done:
-			m.teardown(conn, fmt.Errorf("MCU-Lite: the dash closed %s", name))
+			m.teardown(s, conn, fmt.Errorf("MCU-Lite: the dash closed %s", name))
 		case <-s.quit:
-			m.teardown(conn, nil)
+			m.teardown(s, conn, nil)
 		}
 	}()
 }
 
 // teardown closes every MCU-Lite channel and ends the session with reason, unless from is no
 // longer one of them (it was replaced) or the session is stopping anyway.
-func (m *MCULite) teardown(from net.Conn, reason error) {
+// s is the server from's run was served by: a watcher that fires late reports to its own run,
+// never to the one that has since taken this MCULite over.
+func (m *MCULite) teardown(s *PXCControl, from net.Conn, reason error) {
 	m.mu.Lock()
 	if from != m.ctrl && from != m.phone && from != m.data {
 		m.mu.Unlock()
@@ -241,11 +249,11 @@ func (m *MCULite) teardown(from net.Conn, reason error) {
 	m.mu.Unlock()
 	for _, c := range conns {
 		if c != nil && c != from {
-			m.quietClose(c)
+			m.quietClose(s, c)
 		}
 	}
-	if reason != nil && !m.pxc.isStopping() {
-		m.pxc.emitError(&PxcError{PxcTimeoutErr, reason, true})
+	if reason != nil && !s.isStopping() {
+		s.emitError(&PxcError{PxcTimeoutErr, reason, true})
 	}
 }
 
@@ -291,7 +299,7 @@ func (m *MCULite) serveData(conn net.Conn) {
 		_ = tcp.SetKeepAlive(true)
 	}
 	m.mu.Lock()
-	cfg := m.mirror
+	cfg, pxc := m.mirror, m.pxc
 	m.mu.Unlock()
 	if cfg == nil {
 		logging.Printf("MCU-Lite data socket before any MirrorConfig, closing it (c0.java:136-140)")
@@ -309,7 +317,7 @@ func (m *MCULite) serveData(conn net.Conn) {
 	// that write (c0.java:21-40). In that order: once the socket closes this server returns and
 	// takes itself out of the session, and the teardown would find nothing of its own to end.
 	end := func(reason error) {
-		m.teardown(conn, reason)
+		m.teardown(pxc, conn, reason)
 		_ = conn.Close()
 	}
 	watchdog := time.AfterFunc(timeout, func() {

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	stdnet "net"
 	"os"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -171,6 +172,10 @@ func NewMobileConfig(static []byte, fps int, startupTimeoutSec, teardownTimeoutS
 	}
 }
 
+// MobileCallback hears a session. Each call runs on a goroutine of its own. A start after a stop
+// waits until every call of the stopped run has returned - these, DashFeatureListener's and
+// MCULiteCallback's - so nothing of a run arrives once the next has begun; a callback must
+// therefore not start the session itself, or wait for something that does.
 type MobileCallback interface {
 	OnError(msg string, fatal bool)
 	OnEvent(time int64, source int, command int, payload []byte)
@@ -197,9 +202,18 @@ type MobileSession struct {
 
 	hud      *core.CfmotoHUD
 	mux      *stream.MuxSource
+	live     *stream.LiveStreamSource
+	static   *stream.RawFrameSource // nil without a StaticSignal
 	streamer *stream.AUStreamer
 
-	stopped chan struct{}
+	// One run's relays, stop watcher and calls into the host, from arm to the run's stop; see rearm.
+	rearmMu sync.Mutex
+	stopped atomic.Pointer[chan struct{}] // the run's: closed once it has stopped
+	runWG   sync.WaitGroup                // the run's relays and stop watcher
+	calls   atomic.Pointer[hostCalls]     // the run's other goroutines; see spawn
+	// pushMu lets rearm wait out a push checked against the stopped run - PushFrame, PushStill,
+	// PushJpeg and the MCU-Lite ones - so neither what it pushed nor its callback reaches the next.
+	pushMu sync.RWMutex
 
 	// usbDial, when set, connects the adb tunnel's streams instead of 127.0.0.1 (tests).
 	usbDial func(service string) (stdnet.Conn, error)
@@ -211,19 +225,19 @@ type MobileSession struct {
 
 func NewMobileSession(cfg *MobileConfig, cb MobileCallback) (*MobileSession, error) {
 	ms := &MobileSession{
-		cfg:     *cfg,
-		cb:      cb,
-		stopped: make(chan struct{}),
+		cfg: *cfg,
+		cb:  cb,
 	}
+	ms.calls.Store(&hostCalls{})
 
 	// Setup Sources
 	var static stream.FrameSource
 	if len(cfg.StaticSignal) > 0 {
-		var err error
-		static, err = stream.NewRawFrameSource(cfg.StaticSignal, cfg.TargetFPS)
+		raw, err := stream.NewRawFrameSource(cfg.StaticSignal, cfg.TargetFPS)
 		if err != nil {
 			return nil, err
 		}
+		static, ms.static = raw, raw
 	}
 	// 6 queued AUs ≈ 200ms at 30fps: absorbs producer/poll clock jitter without
 	// dropping frames of a predictive (GOP/intra-refresh) stream, while keeping
@@ -246,6 +260,7 @@ func NewMobileSession(cfg *MobileConfig, cb MobileCallback) (*MobileSession, err
 		})
 	}
 	ms.mux = &stream.MuxSource{NoSignal: static, Live: live}
+	ms.live = live
 
 	// Build streamer
 	ms.streamer = stream.NewAUStreamer(live)
@@ -267,39 +282,131 @@ func NewMobileSession(cfg *MobileConfig, cb MobileCallback) (*MobileSession, err
 	}
 	ms.hud.SetSkipDashClockSync(cfg.SkipDashClockSync)
 	ms.hud.SetDashAsksForTime(cfg.DashAsksForTime)
+	ms.arm()
+
+	return ms, nil
+}
+
+// arm binds the error and event relays, the stop watcher and IsRunning to the HUD's current run.
+// Its goroutines, and the callbacks they start, end with that run.
+func (ms *MobileSession) arm() {
+	errs, events, done := ms.hud.Errors(), ms.hud.Events(), ms.hud.Done()
+	stopped := make(chan struct{})
+	ms.stopped.Store(&stopped)
+	ms.runWG.Add(3)
 	go func() {
+		defer ms.runWG.Done()
 		for {
 			select {
-			case cErr, ok := <-ms.hud.Errors:
-				if !ok {
-					// if we close Errors, this lets us exit cleanly
-					return
-				}
+			case cErr := <-errs:
 				if cErr != nil {
 					ms.relayError(cErr)
 				}
-			case <-ms.hud.Done():
+			case <-done:
 				return // HUD session is over - stop relaying
 			}
 		}
 	}()
 	go func() {
+		defer ms.runWG.Done()
 		for {
 			select {
-			case evt, ok := <-ms.hud.Events:
-				if !ok {
-					return
-				}
+			case evt := <-events:
 				ms.relayEvent(evt)
-			case <-ms.hud.Done():
+			case <-done:
 				return
 			}
 		}
 	}()
+	go func() {
+		defer ms.runWG.Done()
+		ms.watchHud(done, stopped)
+	}()
+}
 
-	go ms.watchHud()
+// rearm readies a session whose last run has stopped for another start, so the new run behaves as
+// a new session would: its own relays, OnStopped again once when it stops, an empty video queue
+// in the configured mode, and the bound DashFeatures listening again from scratch. The host keeps
+// the session's settings, the DashFeatures it made and its callback. A no-op before the first stop.
+//
+// Nothing of the stopped run reaches the host once the next has begun: every producer it had is
+// waited out first, then everything they started, and a straggler is dropped.
+func (ms *MobileSession) rearm() error {
+	ms.rearmMu.Lock()
+	defer ms.rearmMu.Unlock()
+	select {
+	case <-ms.hud.Done():
+	default:
+		return nil // the run has not stopped: nothing to re-arm
+	}
+	// Its relays and stop watcher.
+	ms.runWG.Wait()
+	// A push that passed IsRunning before the stop; any later one finds IsRunning false and touches
+	// nothing. A barrier, not held across the waits below, where a callback may push.
+	ms.pushMu.Lock()
+	ms.pushMu.Unlock()
+	// A start the stop gave up waiting for, and its servers, which can outlive the stop's bound and
+	// call the MCU-Lite callbacks or open the USB link's streams.
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(ms.cfg.StartupTimeoutSec)*time.Second)
+	defer cancel()
+	if err := ms.hud.Settled(ctx); err != nil {
+		return errors.New("the last run is still stopping")
+	}
+	// Then what they all started: its OnStopped, its events, its feature commands, its USB link.
+	// Closed in place, so a straggler spawned meanwhile finds it closed and is dropped.
+	old := ms.calls.Load()
+	old.close()
+	old.wg.Wait()
+	ms.calls.Store(&hostCalls{})
+	if !ms.hud.Rearm() {
+		return nil
+	}
+	ms.live.Reset(ms.cfg.JpegStillsEnabled)
+	if ms.static != nil {
+		ms.static.Rewind()
+	}
+	if f := ms.features.Load(); f != nil {
+		f.rearm()
+	}
+	ms.arm()
+	return nil
+}
 
-	return ms, nil
+// hostCalls counts one run's goroutines that are not its relays: its calls into the host and
+// whatever else of it could outlive its stop. Once closed it takes no more: what is spawned on it
+// then is a straggler of a run that is over, and is dropped.
+type hostCalls struct {
+	mu     sync.Mutex
+	closed bool
+	wg     sync.WaitGroup
+}
+
+func (c *hostCalls) close() {
+	c.mu.Lock()
+	c.closed = true
+	c.mu.Unlock()
+}
+
+// spawn runs f on a goroutine of its own, counted in the current run so the next one opens only
+// once f has returned. Every call into the host - MobileCallback, DashFeatureListener and
+// MCULiteCallback methods - goes through it, and so does the USB link's adb server.
+func (ms *MobileSession) spawn(f func()) {
+	c := ms.calls.Load()
+	if c == nil { // a session not made by NewMobileSession (tests)
+		ms.calls.CompareAndSwap(nil, &hostCalls{})
+		c = ms.calls.Load()
+	}
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return
+	}
+	c.wg.Add(1)
+	c.mu.Unlock()
+	go func() {
+		defer c.wg.Done()
+		f()
+	}()
 }
 
 func (ms *MobileSession) relayError(err error) {
@@ -312,7 +419,7 @@ func (ms *MobileSession) relayError(err error) {
 	}
 
 	if ms.cb != nil {
-		go ms.cb.OnError(msg, fatal)
+		ms.spawn(func() { ms.cb.OnError(msg, fatal) })
 	}
 }
 
@@ -341,23 +448,22 @@ func (ms *MobileSession) relayEvent(evt core.HudEvent) {
 	// Queued here, before OnEvent, so the features see the dash's commands in the order it sent
 	// them; they run on their own worker, so a listener that blocks never holds up this relay.
 	if f := ms.features.Load(); f != nil && evt.Source == core.EventSourcePXC {
-		f.enqueue(timestamp, command, payload)
+		f.enqueue(ms.spawn, timestamp, command, payload)
 	}
 	if ms.cb != nil {
-		go ms.cb.OnEvent(timestamp, src, command, payload)
+		ms.spawn(func() { ms.cb.OnEvent(timestamp, src, command, payload) })
 	}
 }
 
-func (ms *MobileSession) watchHud() {
-	<-ms.hud.Done()
+func (ms *MobileSession) watchHud(done <-chan any, stopped chan struct{}) {
+	<-done
 	if f := ms.features.Load(); f != nil {
 		f.discard()
 	}
-	// notify callback
+	close(stopped)
 	if ms.cb != nil {
-		go ms.cb.OnStopped()
+		ms.spawn(ms.cb.OnStopped)
 	}
-	close(ms.stopped)
 }
 
 // DiscoverHost uses zeroconf to search for the mDNS service, use only if SELinux or the mobile OS allows for it
@@ -387,6 +493,9 @@ func (ms *MobileSession) SetECHost(host *StreamHost) error {
 }
 
 func (ms *MobileSession) StartSession() error {
+	if err := ms.rearm(); err != nil {
+		return err
+	}
 	ctxWithTimeout, cancel := context.WithTimeout(context.Background(), time.Duration(ms.cfg.StartupTimeoutSec)*time.Second)
 	defer cancel()
 	if err := ms.hud.StartStream(ctxWithTimeout); err != nil {
@@ -415,6 +524,9 @@ func (ms *MobileSession) StartSessionWithSocketFd(fd int64) error {
 		return fmt.Errorf("unable to release EC init descriptor: %w", closeErr)
 	}
 	defer conn.Close() // the EC init closes it too; this covers a start refused before the init
+	if err := ms.rearm(); err != nil {
+		return err
+	}
 
 	ctxWithTimeout, cancel := context.WithTimeout(context.Background(), time.Duration(ms.cfg.StartupTimeoutSec)*time.Second)
 	defer cancel()
@@ -435,6 +547,8 @@ func (ms *MobileSession) StopSession() error {
 }
 
 func (ms *MobileSession) PushFrame(avccChunk []byte) {
+	ms.pushMu.RLock()
+	defer ms.pushMu.RUnlock()
 	if !ms.hud.IsRunning() {
 		return
 	}
@@ -445,7 +559,7 @@ func (ms *MobileSession) PushFrame(avccChunk []byte) {
 	au, err := BuildAnnexBAU(avccChunk)
 	if err != nil {
 		if ms.cb != nil {
-			go ms.cb.OnError("invalid AVCC: "+err.Error(), false)
+			ms.spawn(func() { ms.cb.OnError("invalid AVCC: "+err.Error(), false) })
 		}
 		logging.Printf("MobileSession: invalid AVCC: %v\n", err)
 		return
@@ -460,6 +574,8 @@ func (ms *MobileSession) PushFrame(avccChunk []byte) {
 // predictive stream. Only useful with MobileConfig.JpegStillsEnabled, which is what makes the
 // queue accept these and the capture negotiation announce them.
 func (ms *MobileSession) PushStill(jpeg []byte) {
+	ms.pushMu.RLock()
+	defer ms.pushMu.RUnlock()
 	if !ms.hud.IsRunning() {
 		return
 	}
@@ -470,7 +586,7 @@ func (ms *MobileSession) PushStill(jpeg []byte) {
 		// Pushing a still into a session that negotiated H.264 would put a JPEG on the wire
 		// inside a frame the dash is parsing as an access unit. Refusing loudly beats that.
 		if ms.cb != nil {
-			go ms.cb.OnError("PushStill called on a session that did not negotiate JPEG", false)
+			ms.spawn(func() { ms.cb.OnError("PushStill called on a session that did not negotiate JPEG", false) })
 		}
 		logging.Printf("MobileSession: PushStill ignored, JpegStillsEnabled is off\n")
 		return
@@ -509,7 +625,7 @@ func (ms *MobileSession) SendPhoneCommand(command int64, body []byte, timeoutMs 
 
 func (ms *MobileSession) IsRunning() bool {
 	select {
-	case <-ms.stopped:
+	case <-*ms.stopped.Load():
 		return false
 	default:
 		return true

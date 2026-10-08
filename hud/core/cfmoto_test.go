@@ -6,10 +6,13 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/json"
+	"errors"
+	stdnet "net"
 	"testing"
 	"time"
 
 	"github.com/charliecharlieO-o/ridedaemon-go/hud/net"
+	"github.com/charliecharlieO-o/ridedaemon-go/hud/stream"
 )
 
 func TestStopBeforeStartSignalsDone(t *testing.T) {
@@ -28,13 +31,13 @@ func TestPxcCoordinatorForwardsConfigAndSignalsHeartbeat(t *testing.T) {
 	hud := NewCfmotoHUD(30, nil, 0)
 	pxc := &net.PXCControl{Events: make(chan net.PXCResponse, 2)}
 	ready := make(chan any, 1)
-	hud.startPxcEventFwd(pxc, ready)
+	hud.startPxcEventFwd(hud.run, pxc, ready)
 
 	payload := json.RawMessage(`{"HUName":"MTX800"}`)
 	pxc.Events <- net.PXCResponse{Command: net.PxcHudConf, Body: payload}
 	pxc.Events <- net.PXCResponse{Command: net.PxcHeartbeatOk}
 
-	if event := <-hud.Events; event.Source != EventSourcePXC ||
+	if event := <-hud.Events(); event.Source != EventSourcePXC ||
 		event.Cmd != int(net.PxcHudConf) ||
 		string(event.Data.(json.RawMessage)) != string(payload) {
 		t.Fatalf("unexpected PXC config event: %+v", event)
@@ -44,7 +47,7 @@ func TestPxcCoordinatorForwardsConfigAndSignalsHeartbeat(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("PXC heartbeat acknowledgement did not signal readiness")
 	}
-	if event := <-hud.Events; event.Cmd != int(net.PxcHeartbeatOk) {
+	if event := <-hud.Events(); event.Cmd != int(net.PxcHeartbeatOk) {
 		t.Fatalf("heartbeat event = %+v, want heartbeat ACK", event)
 	}
 	close(pxc.Events)
@@ -61,13 +64,13 @@ func TestSetHostWhenRunningReturnsErrorWithoutPanicking(t *testing.T) {
 func TestVideoFramingDecisionIsForwardedAsTransportEvent(t *testing.T) {
 	hud := NewCfmotoHUD(30, nil, 0)
 
-	hud.handleServerEvent(HudEvent{
+	hud.run.event(HudEvent{
 		Source: EventSourceTransport,
 		Cmd:    TransportCmdVideoFraming,
 		Data:   []byte{0, 1},
 	})
 
-	event := <-hud.Events
+	event := <-hud.Events()
 	if event.Source != EventSourceTransport || event.Cmd != TransportCmdVideoFraming {
 		t.Fatalf("transport event was rewrapped: %+v", event)
 	}
@@ -140,5 +143,135 @@ func TestPhoneIdentityShapesTheClientInfoReply(t *testing.T) {
 	hud.running = true
 	if err := hud.SetPhoneIdentity(PhoneIdentity{Model: "x"}); err == nil {
 		t.Fatal("the identity changed under a running session")
+	}
+}
+
+// A run that has stopped reports into its own channels and can stop only itself: whatever its
+// servers still have to say, or a fatal error they raise late, never reaches the next run.
+func TestAStoppedRunCannotReachTheNext(t *testing.T) {
+	hud := NewCfmotoHUD(30, nil, 0)
+	if hud.Rearm() {
+		t.Fatal("Rearm replaced a run that had not stopped")
+	}
+	old := hud.run
+	if err := hud.StopStream(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !hud.Rearm() {
+		t.Fatal("Rearm kept a stopped run")
+	}
+	old.event(HudEvent{Source: EventSourceTransport, Cmd: TransportCmdVideoFraming})
+	hud.handleServerError(old, errors.New("late"))
+	if err := hud.stopRun(context.Background(), old); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-hud.Done():
+		t.Fatal("the stopped run's stop ended the next run")
+	case e := <-hud.Events():
+		t.Fatalf("the next run heard the stopped run's event %+v", e)
+	case err := <-hud.Errors():
+		t.Fatalf("the next run heard the stopped run's error %v", err)
+	default:
+	}
+}
+
+// A stop that arrives while another is taking the run down waits for it instead of ending the run
+// early: ending it would let the next run open while the first stop's servers still hold the ports.
+// A start on that run is refused the same way.
+func TestASecondStopWaitsForTheFirst(t *testing.T) {
+	hud := NewCfmotoHUD(30, nil, 0)
+	hud.run.stopping = true // the first stop, still shutting the servers down
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if err := hud.StopStream(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if hud.run.isStopped() || hud.Rearm() {
+		t.Fatal("a second stop ended the run before the first had")
+	}
+	if err := hud.StartStream(context.Background()); !errors.Is(err, ErrStopped) {
+		t.Fatalf("a start on a run being stopped returned %v", err)
+	}
+}
+
+// stuckServer's Stop gives up when its bound does and finishes only once released.
+type stuckServer struct{ release chan struct{} }
+
+func (s *stuckServer) Start() error { return nil }
+func (s *stuckServer) Stop(ctx context.Context) error {
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-s.release:
+		return nil
+	}
+}
+
+// A stop returns at its bound even when a server is still unwinding, but that server shares the
+// video queue, the capture config and the MCU-Lite state with the next run: the next start waits.
+func TestTheNextStartWaitsForAServerStillStopping(t *testing.T) {
+	hud := NewCfmotoHUD(30, &stream.MuxSource{}, 0)
+	stuck := &stuckServer{release: make(chan struct{})}
+	spent, cancel := context.WithCancel(context.Background())
+	cancel() // the stop's bound, already over
+	hud.unwind(spent, []StoppableServer{stuck})
+
+	listen := func() {
+		var ls [3]stdnet.Listener
+		for i := range ls {
+			ln, err := stdnet.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = ln.Close() })
+			ls[i] = ln
+		}
+		if err := hud.SetListeners(ls[0], ls[1], ls[2]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	listen()
+	ctx, cancelStart := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancelStart()
+	err := hud.StartStreamOverLink(ctx, func() error {
+		t.Error("started beside a server still stopping")
+		return nil
+	})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("start beside a stopping server returned %v", err)
+	}
+
+	settle := func() error {
+		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+		defer cancel()
+		return hud.Settled(ctx)
+	}
+	if err := settle(); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Settled beside a server still stopping: %v", err)
+	}
+
+	close(stuck.release)
+	listen()
+	stop := errors.New("got past the wait")
+	if err := hud.StartStreamOverLink(context.Background(), func() error { return stop }); !errors.Is(err, stop) {
+		t.Fatalf("start after the server stopped returned %v", err)
+	}
+
+	// A start in flight is not settled either, nor are the servers its failure leaves stopping.
+	listen()
+	release := make(chan struct{})
+	go func() { _ = hud.StartStreamOverLink(context.Background(), func() error { <-release; return stop }) }()
+	for registered := false; !registered; time.Sleep(time.Millisecond) { // until the start has registered
+		hud.mu.Lock()
+		registered = hud.startDone != nil
+		hud.mu.Unlock()
+	}
+	if err := settle(); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Settled beside a start in flight: %v", err)
+	}
+	close(release)
+	if err := hud.Settled(context.Background()); err != nil {
+		t.Fatal(err)
 	}
 }

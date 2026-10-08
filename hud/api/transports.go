@@ -71,6 +71,11 @@ func (ms *MobileSession) StartSessionOverUSB(accessory Stream) error {
 		return errors.New("no accessory stream")
 	}
 	link := &streamRW{s: accessory}
+	if err := ms.rearm(); err != nil {
+		_ = link.Close()
+		return err
+	}
+	done := ms.hud.Done() // the run this start opens; the link ends with it
 	device := net.NewADBDevice(link)
 	device.Dial = ms.usbDial
 	device.OnBanner = func(banner string) {
@@ -84,9 +89,11 @@ func (ms *MobileSession) StartSessionOverUSB(accessory Stream) error {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(ms.cfg.StartupTimeoutSec)*time.Second)
 	defer cancel()
 	err := ms.hud.StartStreamOverLink(ctx, func() error {
-		go func() {
+		// Counted in this run: the next waits for it, so a packet still buffered here can never
+		// open a stream to the next run's listeners. It ends when the link closes, with the run.
+		ms.spawn(func() {
 			logging.Printf("USB accessory link ended: %v", device.Serve())
-		}()
+		})
 		return nil
 	})
 	if err != nil {
@@ -94,7 +101,7 @@ func (ms *MobileSession) StartSessionOverUSB(accessory Stream) error {
 		return err
 	}
 	go func() {
-		<-ms.hud.Done()
+		<-done
 		_ = link.Close()
 	}()
 	return nil
@@ -129,21 +136,25 @@ func (ms *MobileSession) EnableMCULite(cb MCULiteCallback) error {
 		return nil
 	}
 	m.OnClientInfo = func(c net.MCULiteClientInfo) {
-		go cb.OnClientInfo(c.HUID, c.UUID, int(c.Channel), int(c.Flavor), int(c.SupportFunction))
+		ms.spawn(func() { cb.OnClientInfo(c.HUID, c.UUID, int(c.Channel), int(c.Flavor), int(c.SupportFunction)) })
 	}
 	m.OnMirrorConfig = func(c net.MCULiteMirrorConfig) {
-		go cb.OnMirrorConfig(int(c.Width), int(c.Height), int(c.Fps), int(c.Quality), int(c.Dpi),
-			float64(c.ScreenWidth), float64(c.ScreenHeight))
+		ms.spawn(func() {
+			cb.OnMirrorConfig(int(c.Width), int(c.Height), int(c.Fps), int(c.Quality), int(c.Dpi),
+				float64(c.ScreenWidth), float64(c.ScreenHeight))
+		})
 	}
-	m.OnGPSDue = func() { go cb.OnGPSDue() }
-	m.OnWeatherDue = func() { go cb.OnWeatherDue() }
+	m.OnGPSDue = func() { ms.spawn(cb.OnGPSDue) }
+	m.OnWeatherDue = func() { ms.spawn(cb.OnWeatherDue) }
 	return nil
 }
 
 // PushMCULiteJPEG offers the MCU-Lite dash a new still; it is resent on every frame credit until
 // the next one. Keep each under 25000 bytes, as CarbitRide does by lowering the quality.
 func (ms *MobileSession) PushMCULiteJPEG(jpeg []byte) {
-	if m := ms.hud.MCULite(); m != nil {
+	ms.pushMu.RLock()
+	defer ms.pushMu.RUnlock()
+	if m := ms.hud.MCULite(); m != nil && ms.hud.IsRunning() {
 		m.PushJPEG(jpeg)
 	}
 }
@@ -151,7 +162,9 @@ func (ms *MobileSession) PushMCULiteJPEG(jpeg []byte) {
 // SetMCULiteGPS queues one GPS frame, sent ahead of the picture. Every value is a string as
 // CarbitRide sends it: time is SystemClock.uptimeMillis(), status false when there is no fix.
 func (ms *MobileSession) SetMCULiteGPS(status bool, latitude, longitude, altitude, speed, course, time string) {
-	if m := ms.hud.MCULite(); m != nil {
+	ms.pushMu.RLock()
+	defer ms.pushMu.RUnlock()
+	if m := ms.hud.MCULite(); m != nil && ms.hud.IsRunning() {
 		m.SetGPS(net.MCULiteGPS{Status: status, Latitude: latitude, Longitude: longitude,
 			Altitude: altitude, Speed: speed, Course: course, Time: time})
 	}
@@ -159,7 +172,9 @@ func (ms *MobileSession) SetMCULiteGPS(status bool, latitude, longitude, altitud
 
 // SetMCULiteWeather queues one weather frame, sent ahead of the picture.
 func (ms *MobileSession) SetMCULiteWeather(adCode, city, humidity, province, reportTime, temperature, weather, windDirection, windPower string) {
-	if m := ms.hud.MCULite(); m != nil {
+	ms.pushMu.RLock()
+	defer ms.pushMu.RUnlock()
+	if m := ms.hud.MCULite(); m != nil && ms.hud.IsRunning() {
 		m.SetWeather(net.MCULiteWeather{AdCode: adCode, City: city, Humidity: humidity,
 			Province: province, ReportTime: reportTime, Temperature: temperature, Weather: weather,
 			WindDirection: windDirection, WindPower: windPower})

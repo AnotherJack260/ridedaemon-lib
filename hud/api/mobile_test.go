@@ -7,6 +7,7 @@ import (
 	"io"
 	stdnet "net"
 	"runtime"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -158,7 +159,6 @@ func fakeDash(t *testing.T) stdnet.Listener {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = dash.Close() })
-	_ = dash.(*stdnet.TCPListener).SetDeadline(time.Now().Add(5 * time.Second))
 	return dash
 }
 
@@ -181,6 +181,7 @@ func sessionFor(t *testing.T, dash stdnet.Listener) (*MobileSession, []string) {
 // acceptInit takes the phone's EC connection and reads its whole init command.
 func acceptInit(t *testing.T, dash stdnet.Listener) stdnet.Conn {
 	t.Helper()
+	_ = dash.(*stdnet.TCPListener).SetDeadline(time.Now().Add(5 * time.Second))
 	conn, err := dash.Accept()
 	if err != nil {
 		t.Fatalf("the phone never dialled the EC port: %v", err)
@@ -350,5 +351,151 @@ func requireNoGoroutineLeak(t *testing.T, before int) {
 	if now := runtime.NumGoroutine(); now > before {
 		stacks := make([]byte, 1<<20)
 		t.Fatalf("%d goroutines before, %d after:\n%s", before, now, stacks[:runtime.Stack(stacks, true)])
+	}
+}
+
+// runRecorder hears a session's OnEvent as {source, command, OnStopped calls so far}.
+type runRecorder struct {
+	events chan [3]int
+	stops  atomic.Int32
+}
+
+func (r *runRecorder) OnError(string, bool) {}
+func (r *runRecorder) OnEvent(_ int64, source int, command int, _ []byte) {
+	r.events <- [3]int{source, command, int(r.stops.Load())}
+}
+func (r *runRecorder) OnStopped() { r.stops.Add(1) }
+
+// await waits for one OnEvent, which must come after exactly stops OnStopped calls.
+func (r *runRecorder) await(t *testing.T, source, command, stops int) {
+	t.Helper()
+	timeout := time.After(2 * time.Second)
+	for {
+		select {
+		case e := <-r.events:
+			if e[0] == source && e[1] == command {
+				if e[2] != stops {
+					t.Fatalf("event 0x%x heard after %d OnStopped, want %d", command, e[2], stops)
+				}
+				return
+			}
+		case <-timeout:
+			t.Fatalf("no OnEvent source %d command 0x%x", source, command)
+		}
+	}
+}
+
+// The app retries EasyConn on the same MobileSession, calling StopSession between attempts. A run
+// after a stop used to have no event relay, no stop watcher and a discarded DashFeatures: nothing
+// the dash said in it reached the app, and its stop was never reported. Each run now behaves as a
+// new session's would, and the last run's OnStopped always comes before anything of the next.
+func TestSessionRunsAgainAfterStop(t *testing.T) {
+	before := runtime.NumGoroutine()
+	cb := &runRecorder{events: make(chan [3]int, 256)}
+	session, err := NewMobileSession(NewMobileConfig(nil, 30, 25, 5, 1, 1), cb)
+	if err != nil {
+		t.Fatal(err)
+	}
+	features := NewDashFeatures(session, nil) // before the first start, as the app makes it
+	dash := fakeDash(t)
+	host, port, _ := stdnet.SplitHostPort(dash.Addr().String())
+	if err := session.SetECHost(NewStreamHost(host, port, "com.cfmoto.cfmotointernational")); err != nil {
+		t.Fatal(err)
+	}
+
+	// Run 1, the app's failed attempt: the dash never answers the init and the app stops it.
+	useEphemeralPorts(t, session)
+	started := make(chan error, 1)
+	go func() { started <- session.StartSession() }()
+	ec := acceptInit(t, dash)
+	if err := session.StopSession(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-started; !errors.Is(err, core.ErrStopped) {
+		t.Fatalf("run 1: %v", err)
+	}
+	_ = ec.Close()
+
+	// Runs 2 and 3, each started right after the last stop: a dash that completes the handshake
+	// and negotiates the capture.
+	for run := 2; run <= 3; run++ {
+		ports := useEphemeralPorts(t, session)
+		go func() { started <- session.StartSession() }()
+		ec := acceptInit(t, dash)
+		if _, err := ec.Write(ecInitOK); err != nil {
+			t.Fatal(err)
+		}
+		pxcConn, err := stdnet.Dial("tcp", ports[0])
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := pxcConn.Write(pxc(net.PxcHeartbeat, nil)); err != nil {
+			t.Fatal(err)
+		}
+		if err := <-started; err != nil {
+			t.Fatalf("run %d: StartSession: %v", run, err)
+		}
+		if !session.IsRunning() {
+			t.Fatalf("run %d: not running", run)
+		}
+		features.queueMu.Lock()
+		discarded := features.discarded
+		features.queueMu.Unlock()
+		if discarded {
+			t.Fatalf("run %d: the session's DashFeatures still discarded", run)
+		}
+		cb.await(t, int(core.EventSourcePXC), int(net.PxcHeartbeat), run-1)
+
+		ctrl, err := stdnet.Dial("tcp", ports[1])
+		if err != nil {
+			t.Fatal(err)
+		}
+		capture := make([]byte, 8+32) // CAPTURE_CONFIG: 800x480, H.264
+		binary.LittleEndian.PutUint16(capture[0:], net.MediaCtrlInit)
+		binary.LittleEndian.PutUint16(capture[2:], 32)
+		binary.LittleEndian.PutUint16(capture[8:], 800)
+		binary.LittleEndian.PutUint16(capture[10:], 480)
+		binary.LittleEndian.PutUint32(capture[16:], 2)
+		if _, err := ctrl.Write(capture); err != nil {
+			t.Fatal(err)
+		}
+		cb.await(t, int(core.EventSourceTransport), core.TransportCmdCaptureConfig, run-1)
+
+		if err := session.StopSession(); err != nil {
+			t.Fatal(err)
+		}
+		_ = ec.Close()
+		_ = pxcConn.Close()
+		_ = ctrl.Close()
+	}
+
+	// One OnStopped per run, and no more.
+	deadline := time.Now().Add(2 * time.Second)
+	for cb.stops.Load() < 3 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if n := cb.stops.Load(); n != 3 {
+		t.Fatalf("%d OnStopped for 3 runs", n)
+	}
+	if session.IsRunning() {
+		t.Fatal("IsRunning after the last stop")
+	}
+	requireNoGoroutineLeak(t, before)
+}
+
+// A session made without a callback has nothing counted in its run; a restart must not trip on that.
+func TestSessionWithoutCallbackStartsAgainAfterStop(t *testing.T) {
+	session, err := NewMobileSession(NewMobileConfig(nil, 30, 1, 1, 1, 1), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := session.StopSession(); err != nil {
+		t.Fatal(err)
+	}
+	defer session.StopSession()
+	// No host set: the start gets as far as asking for one, which it can only do on a new run.
+	if err := session.StartSession(); err == nil || errors.Is(err, core.ErrStopped) {
+		t.Fatalf("StartSession after a stop: %v", err)
 	}
 }

@@ -204,7 +204,8 @@ type queuedPxcEvent struct {
 // replaces the first DashFeatures, which then hears nothing more, not even what it had queued.
 //
 // ponytail: CarbitRide resets the icon count and the notification gate when the phone channel
-// reconnects (sdk/b0.java:354-367); here they last for the session, since it is the same dash.
+// reconnects (sdk/b0.java:354-367); here they last for the run (a restart forgets them), since it
+// is the same dash.
 func NewDashFeatures(session *MobileSession, listener DashFeatureListener) *DashFeatures {
 	cfg := session.cfg
 	f := &DashFeatures{
@@ -304,7 +305,10 @@ func (f *DashFeatures) HandlePxcEvent(timeMs int64, command int, payload []byte)
 // HandlePxcEvent acts on is queued - CLIENT_INFO and the feature commands, never the heartbeats -
 // at most maxQueuedFeatureEvents of it, the oldest dropped first. The worker exists only while
 // there is something to handle.
-func (f *DashFeatures) enqueue(timeMs int64, command int, payload []byte) {
+//
+// spawn starts the worker: the session's, so the worker counts as one of the run's goroutines and
+// the next run starts only once this run's commands are all handled.
+func (f *DashFeatures) enqueue(spawn func(func()), timeMs int64, command int, payload []byte) {
 	if cmd := uint32(command); cmd != net.PxcHudConf && !net.IsFeatureCommand(cmd) {
 		return
 	}
@@ -322,7 +326,7 @@ func (f *DashFeatures) enqueue(timeMs int64, command int, payload []byte) {
 	f.draining = true
 	f.queueMu.Unlock()
 	if start {
-		go f.drain()
+		spawn(f.drain)
 	}
 }
 
@@ -331,6 +335,19 @@ func (f *DashFeatures) enqueue(timeMs int64, command int, payload []byte) {
 func (f *DashFeatures) discard() {
 	f.queueMu.Lock()
 	f.queue, f.discarded = nil, true
+	f.queueMu.Unlock()
+}
+
+// rearm makes a DashFeatures its session's stop discarded hear the session's next run, with what
+// it knew about the last dash forgotten, as NewDashFeatures leaves it.
+func (f *DashFeatures) rearm() {
+	f.mu.Lock()
+	f.maxNaviIcon, f.notifyEnabled, f.info = net.DefaultMaxNaviIcon, false, net.FeatureClientInfo{}
+	f.lastNavi, f.lastSkip = time.Time{}, time.Time{}
+	f.mu.Unlock()
+	f.queueMu.Lock()
+	// The last run's worker has returned, or was never let start: either way none is draining.
+	f.queue, f.discarded, f.draining = nil, false, false
 	f.queueMu.Unlock()
 }
 

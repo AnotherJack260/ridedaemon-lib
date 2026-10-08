@@ -40,12 +40,12 @@ func main() {
 	// Build Cfmoto HUD
 	cfmotoHUD := core.NewCfmotoHUD(targetFPS, muxSource, 0)
 	go func() {
-		for err := range cfmotoHUD.Errors {
+		for err := range cfmotoHUD.Errors() {
 			log.Printf("Error: %s\n", err)
 		}
 	}()
 	go func() {
-		for evt := range cfmotoHUD.Events {
+		for evt := range cfmotoHUD.Events() {
 			log.Printf("Event: %v\n", evt)
 		}
 	}()

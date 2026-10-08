@@ -34,7 +34,7 @@ func (hud *CfmotoHUD) CaptureConfig() *net.CaptureConfig {
 
 // wireVideo connects the media-control listener to the video listener and the host: the
 // CAPTURE_CONFIG decides how frames are delivered and whether the live queue carries JPEG.
-func (hud *CfmotoHUD) wireVideo(mc *net.MediaControl, ms *net.MediaStream) {
+func (hud *CfmotoHUD) wireVideo(run *hudRun, mc *net.MediaControl, ms *net.MediaStream) {
 	hud.video.capture.Store(nil)
 	mc.CarbitExact = hud.video.carbitExact
 	mc.PhoneModel = hud.phoneConfig.PhoneModel
@@ -48,7 +48,7 @@ func (hud *CfmotoHUD) wireVideo(mc *net.MediaControl, ms *net.MediaStream) {
 		hud.muxSource.SetLivePollMode(c.WantFps == 0)
 		hud.video.capture.Store(&c)
 		payload, _ := json.Marshal(c)
-		hud.handleServerEvent(HudEvent{
+		run.event(HudEvent{
 			Source: EventSourceTransport,
 			Time:   time.Now(),
 			Cmd:    TransportCmdCaptureConfig,

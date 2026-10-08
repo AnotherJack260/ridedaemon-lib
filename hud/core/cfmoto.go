@@ -142,11 +142,36 @@ type CfmotoHUD struct {
 	// Streaming
 	muxSource *stream.MuxSource
 
-	// Communications
+	// run is what the current run's servers report to; see hudRun and Rearm.
+	run *hudRun
+	// unwound closes once every server this HUD has stopped has fully stopped; see unwind.
+	unwound <-chan struct{}
+}
+
+// hudRun is one run of the HUD, from the start that opens it to the stop that ends it. A start's
+// servers report to their own run and never to whichever run is current, so nothing a stopped run
+// still has to say reaches the next one, and a stopped run's fatal error cannot stop the next.
+type hudRun struct {
+	events   chan HudEvent
+	errors   chan error
 	stopped  chan any
 	stopOnce sync.Once
-	Events   chan HudEvent
-	Errors   chan error
+	stopping bool // guarded by CfmotoHUD.mu: a stop is taking this run down
+}
+
+func newHudRun() *hudRun {
+	return &hudRun{events: make(chan HudEvent, 32), errors: make(chan error, 32), stopped: make(chan any)}
+}
+
+func (r *hudRun) stop() { r.stopOnce.Do(func() { close(r.stopped) }) }
+
+func (r *hudRun) isStopped() bool {
+	select {
+	case <-r.stopped:
+		return true
+	default:
+		return false
+	}
 }
 
 func NewCfmotoHUD(targetFPS int, mux *stream.MuxSource, supportFunction int) *CfmotoHUD {
@@ -179,10 +204,61 @@ func NewCfmotoHUD(targetFPS int, mux *stream.MuxSource, supportFunction int) *Cf
 		},
 		targetFPS: targetFPS,
 		muxSource: mux,
-		stopped:   make(chan any),
-		Events:    make(chan HudEvent, 32),
-		Errors:    make(chan error, 32),
+		run:       newHudRun(),
 	}
+}
+
+// Events and Errors are the current run's: what its servers report. Done closes when it stops.
+// Read all three again after Rearm.
+func (hud *CfmotoHUD) Events() <-chan HudEvent { return hud.currentRun().events }
+func (hud *CfmotoHUD) Errors() <-chan error    { return hud.currentRun().errors }
+func (hud *CfmotoHUD) Done() <-chan any        { return hud.currentRun().stopped }
+
+func (hud *CfmotoHUD) currentRun() *hudRun {
+	hud.mu.Lock()
+	defer hud.mu.Unlock()
+	return hud.run
+}
+
+// Settled waits, up to ctx, until nothing of an earlier run can still act: no start in flight (a
+// stop's bound can expire before a cancelled start has unwound) and every server this HUD stopped
+// fully stopped, which can be well after its stop returned.
+func (hud *CfmotoHUD) Settled(ctx context.Context) error {
+	hud.mu.Lock()
+	startDone := hud.startDone
+	hud.mu.Unlock()
+	if startDone != nil {
+		select {
+		case <-startDone:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	// Read after the start: its failure cleanup registers its servers here before startDone closes.
+	hud.mu.Lock()
+	unwound := hud.unwound
+	hud.mu.Unlock()
+	if unwound != nil {
+		select {
+		case <-unwound:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return nil
+}
+
+// Rearm opens a new run once the last one has stopped, so the HUD can be started again and heard
+// as if it were new; it reports whether it did. A run that has not stopped is kept. A start on a
+// stopped run returns ErrStopped: the stop came first.
+func (hud *CfmotoHUD) Rearm() bool {
+	hud.mu.Lock()
+	defer hud.mu.Unlock()
+	if !hud.run.isStopped() {
+		return false
+	}
+	hud.run = newHudRun()
+	return true
 }
 
 // PhoneIdentity is who the phone says it is in the CLIENT_INFO reply. The host keeps these from
@@ -392,7 +468,7 @@ func (hud *CfmotoHUD) SetDashAsksForTime(asks bool) {
 	hud.dashAsksForTime = asks
 }
 
-func (hud *CfmotoHUD) handleServerEvent(evt any) {
+func (r *hudRun) event(evt any) {
 	now := time.Now()
 	hudEvent := HudEvent{Source: UnknownEventSource, Time: now, Data: evt}
 	switch e := evt.(type) {
@@ -410,7 +486,7 @@ func (hud *CfmotoHUD) handleServerEvent(evt any) {
 	}
 
 	select {
-	case hud.Events <- hudEvent:
+	case r.events <- hudEvent:
 	default:
 	}
 }
@@ -423,14 +499,14 @@ func (hud *CfmotoHUD) isFatalErr(err error) bool {
 	return false
 }
 
-func (hud *CfmotoHUD) handleServerError(err error) {
+func (hud *CfmotoHUD) handleServerError(run *hudRun, err error) {
 	if err == nil {
 		return
 	}
 
 	// Bubble up error
 	select {
-	case hud.Errors <- err:
+	case run.errors <- err:
 	default:
 	}
 	if hud.isFatalErr(err) {
@@ -438,12 +514,12 @@ func (hud *CfmotoHUD) handleServerError(err error) {
 		go func() {
 			ctxWithTimeout, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
-			_ = hud.StopStream(ctxWithTimeout)
+			_ = hud.stopRun(ctxWithTimeout, run)
 		}()
 	}
 }
 
-func (hud *CfmotoHUD) startPxcEventFwd(s *net.PXCControl, ready chan<- any) {
+func (hud *CfmotoHUD) startPxcEventFwd(run *hudRun, s *net.PXCControl, ready chan<- any) {
 	// One consumer must both signal readiness and forward diagnostics. Multiple
 	// consumers would race because a Go channel delivers each event only once.
 	go func() {
@@ -454,16 +530,16 @@ func (hud *CfmotoHUD) startPxcEventFwd(s *net.PXCControl, ready chan<- any) {
 				default:
 				}
 			}
-			hud.handleServerEvent(evt)
+			run.event(evt)
 		}
 	}()
 }
 
-func (hud *CfmotoHUD) startMediaEventFwd(s *net.MediaControl) {
+func (hud *CfmotoHUD) startMediaEventFwd(run *hudRun, s *net.MediaControl) {
 	// Media Ctrl events
 	go func() {
 		for evt := range s.Events {
-			hud.handleServerEvent(evt)
+			run.event(evt)
 		}
 	}()
 }
@@ -558,6 +634,12 @@ func (hud *CfmotoHUD) startStream(ctx context.Context, initConn stdnet.Conn, aft
 		hud.mu.Unlock()
 		return errors.New("already running")
 	}
+	run := hud.run
+	if run.stopping || run.isStopped() {
+		hud.mu.Unlock()
+		return ErrStopped
+	}
+	unwound := hud.unwound
 	if hud.host == nil && afterListen == nil {
 		hud.mu.Unlock()
 		return errors.New("host is not set or has not been found")
@@ -579,6 +661,15 @@ func (hud *CfmotoHUD) startStream(ctx context.Context, initConn stdnet.Conn, aft
 		hud.mu.Unlock()
 		close(startDone)
 	}()
+	// The last run's servers may still be unwinding past their stop's bound, and they share the
+	// video queue, the capture config and the MCU-Lite state with this one.
+	if unwound != nil {
+		select {
+		case <-unwound:
+		case <-ctx.Done():
+			return context.Cause(ctx)
+		}
+	}
 
 	if hud.keyPair = hud.identityKey; hud.keyPair == nil {
 		if hud.keyPair, err = net.GenKeyPair(); err != nil {
@@ -600,12 +691,9 @@ func (hud *CfmotoHUD) startStream(ctx context.Context, initConn stdnet.Conn, aft
 
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-
-		// stop reverse order
-		for i := len(servers) - 1; i >= 0; i-- {
-			if stopErr := servers[i].Stop(shutdownCtx); stopErr != nil {
-				logging.Printf("Error stopping server %T: %v", servers[i], stopErr)
-			}
+		select {
+		case <-hud.unwind(shutdownCtx, servers):
+		case <-shutdownCtx.Done():
 		}
 
 		hud.mu.Lock()
@@ -641,7 +729,7 @@ func (hud *CfmotoHUD) startStream(ctx context.Context, initConn stdnet.Conn, aft
 			payload[1] = 1
 		}
 		binary.BigEndian.PutUint32(payload[2:], command)
-		hud.handleServerEvent(HudEvent{
+		run.event(HudEvent{
 			Source: EventSourceTransport,
 			Time:   time.Now(),
 			Cmd:    TransportCmdPageSwitchProbe,
@@ -661,7 +749,7 @@ func (hud *CfmotoHUD) startStream(ctx context.Context, initConn stdnet.Conn, aft
 		if err == nil {
 			payload[1] = 1
 		}
-		hud.handleServerEvent(HudEvent{
+		run.event(HudEvent{
 			Source: EventSourceTransport,
 			Time:   time.Now(),
 			Cmd:    TransportCmdAppStatusNotify,
@@ -669,7 +757,7 @@ func (hud *CfmotoHUD) startStream(ctx context.Context, initConn stdnet.Conn, aft
 		})
 	}
 	pxcServer.OnTransport = func(cmd int, payload []byte) {
-		hud.handleServerEvent(HudEvent{Source: EventSourceTransport, Time: time.Now(), Cmd: cmd, Data: payload})
+		run.event(HudEvent{Source: EventSourceTransport, Time: time.Now(), Cmd: cmd, Data: payload})
 	}
 	pxcServer.SetTimeZoneID(hud.timeZoneID)
 	if hud.timeZoneOffsetSet {
@@ -677,11 +765,11 @@ func (hud *CfmotoHUD) startStream(ctx context.Context, initConn stdnet.Conn, aft
 	}
 	pxcServer.SetSkipDashClockSync(hud.skipDashClockSync)
 	pxcServer.SetDashAsksForTime(hud.dashAsksForTime)
-	hud.startPxcEventFwd(pxcServer, pxcReady)
+	hud.startPxcEventFwd(run, pxcServer, pxcReady)
 	// PXC error handling
 	go func() {
 		for pxcError := range pxcServer.Errors {
-			hud.handleServerError(pxcError)
+			hud.handleServerError(run, pxcError)
 		}
 	}()
 	mediaControl := net.NewMediaControl(":10921")
@@ -707,7 +795,7 @@ func (hud *CfmotoHUD) startStream(ctx context.Context, initConn stdnet.Conn, aft
 	mediaStream := net.NewMediaStream(":10920", hud.muxSource, 0x1000, 3*time.Millisecond)
 	listenOn(mediaStream, 2)
 	mediaStream.SetPlainFramingAllowed(hud.plainVideoFraming)
-	hud.wireVideo(mediaControl, mediaStream)
+	hud.wireVideo(run, mediaControl, mediaStream)
 	pxcServer.HeardElsewhere = mediaStream.LastPoll
 	pxcServer.SetMCULite(hud.mcuLite)
 	mediaStream.SetMCULite(hud.mcuLite)
@@ -715,7 +803,7 @@ func (hud *CfmotoHUD) startStream(ctx context.Context, initConn stdnet.Conn, aft
 		payload := make([]byte, 9)
 		payload[0] = byte(phase)
 		binary.BigEndian.PutUint64(payload[1:], pulls)
-		hud.handleServerEvent(HudEvent{
+		run.event(HudEvent{
 			Source: EventSourceTransport,
 			Time:   time.Now(),
 			Cmd:    TransportCmdVideoPulls,
@@ -734,7 +822,7 @@ func (hud *CfmotoHUD) startStream(ctx context.Context, initConn stdnet.Conn, aft
 			}
 			return 0
 		}
-		hud.handleServerEvent(HudEvent{
+		run.event(HudEvent{
 			Source: EventSourceTransport,
 			Time:   time.Now(),
 			Cmd:    TransportCmdVideoFraming,
@@ -745,15 +833,15 @@ func (hud *CfmotoHUD) startStream(ctx context.Context, initConn stdnet.Conn, aft
 	// Media error handling
 	go func() {
 		for medCtrl := range mediaControl.Errors {
-			hud.handleServerError(medCtrl)
+			hud.handleServerError(run, medCtrl)
 		}
 	}()
 	go func() {
 		for medStr := range mediaStream.Errors {
-			hud.handleServerError(medStr)
+			hud.handleServerError(run, medStr)
 		}
 	}()
-	hud.startMediaEventFwd(mediaControl)
+	hud.startMediaEventFwd(run, mediaControl)
 
 	servers = []StoppableServer{pxcServer, mediaStream, mediaControl}
 	_, err = startReverseServersThenInit(servers, func() error {
@@ -812,8 +900,61 @@ func startReverseServersThenInit(
 	return started, nil
 }
 
-func (hud *CfmotoHUD) StopStream(ctx context.Context) error {
+// unwind stops servers, each on a goroutine of its own, and returns a channel that closes once
+// they - and every server an earlier unwind stopped - have fully stopped. A Stop that runs past ctx
+// is called again without a bound: it then closes the channels its forwarding goroutines range
+// over, and the next start, which waits on hud.unwound, cannot open beside it.
+func (hud *CfmotoHUD) unwind(ctx context.Context, servers []StoppableServer) <-chan struct{} {
+	quiet := make(chan struct{})
 	hud.mu.Lock()
+	prev := hud.unwound
+	hud.unwound = quiet
+	hud.mu.Unlock()
+	var wg sync.WaitGroup
+	for _, server := range servers {
+		if server == nil {
+			continue
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := server.Stop(ctx); err != nil {
+				logging.Printf("Server %T still stopping past its bound: %v", server, err)
+				_ = server.Stop(context.Background())
+			}
+		}()
+	}
+	go func() {
+		wg.Wait()
+		if prev != nil {
+			<-prev
+		}
+		close(quiet)
+	}()
+	return quiet
+}
+
+func (hud *CfmotoHUD) StopStream(ctx context.Context) error {
+	return hud.stopRun(ctx, hud.currentRun())
+}
+
+// stopRun stops run if it is still the current one; a run already replaced has nothing left to stop.
+func (hud *CfmotoHUD) stopRun(ctx context.Context, run *hudRun) error {
+	hud.mu.Lock()
+	if hud.run != run {
+		hud.mu.Unlock()
+		return nil
+	}
+	if run.stopping {
+		// Another stop is taking this run down; it ends once the servers are, so wait for it.
+		hud.mu.Unlock()
+		select {
+		case <-run.stopped:
+		case <-ctx.Done():
+		}
+		return nil
+	}
+	run.stopping = true
 	if !hud.running {
 		// A start still waiting for the dash holds the listeners until it gives up; end it
 		// now and wait for it, so the ports are free when this returns. Cancelled under the
@@ -829,9 +970,7 @@ func (hud *CfmotoHUD) StopStream(ctx context.Context) error {
 			case <-ctx.Done():
 			}
 		}
-		hud.stopOnce.Do(func() {
-			close(hud.stopped)
-		})
+		run.stop()
 		return nil
 	}
 
@@ -849,38 +988,18 @@ func (hud *CfmotoHUD) StopStream(ctx context.Context) error {
 	ctxWithTimeout, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 
-	var wg sync.WaitGroup
-	servers := []StoppableServer{mediaStream, mediaCtrl, pxc}
-
 	logging.Printf("Stopping stream servers")
-	for _, server := range servers {
-		if server == nil {
-			continue
-		}
-		wg.Add(1)
-		go func(server StoppableServer) {
-			defer wg.Done()
-			_ = server.Stop(ctxWithTimeout)
-		}(server)
-	}
-
-	done := make(chan any)
-	go func() {
-		wg.Wait()
-		close(done)
-	}()
-
+	// Bounded, so a stop always returns; each server closed its listener first, so the ports are
+	// free either way. A server still unwinding past this is the next start's to wait for.
 	select {
-	case <-done:
-	case <-ctx.Done():
+	case <-hud.unwind(ctxWithTimeout, []StoppableServer{mediaStream, mediaCtrl, pxc}):
+	case <-ctxWithTimeout.Done():
 	}
 
-	// close(hud.Events) -- treat them as broadcast channels, parent must close attached routines
+	// the run's Events and Errors are never closed: its relays exit on Done
 
 	logging.Printf("signaling hud stopped")
-	hud.stopOnce.Do(func() {
-		close(hud.stopped)
-	})
+	run.stop()
 
 	return nil
 }
@@ -913,10 +1032,6 @@ func (hud *CfmotoHUD) IsRunning() bool {
 	hud.mu.Lock()
 	defer hud.mu.Unlock()
 	return hud.running
-}
-
-func (hud *CfmotoHUD) Done() <-chan any {
-	return hud.stopped
 }
 
 func (hud *CfmotoHUD) SetHost(host *EcHost) error {

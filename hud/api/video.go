@@ -142,13 +142,15 @@ func CarbitEncoderPlan(c *CaptureConfig) *EncoderPlan {
 // (CaptureConfig.JpegRequired), in poll and push mode alike; with JpegStillsEnabled it behaves
 // exactly as PushStill.
 func (ms *MobileSession) PushJpeg(jpeg []byte) {
+	ms.pushMu.RLock()
+	defer ms.pushMu.RUnlock()
 	if !ms.hud.IsRunning() || len(jpeg) == 0 {
 		return
 	}
 	if c := ms.hud.CaptureConfig(); !ms.cfg.JpegStillsEnabled && (c == nil || c.Encoder != 1) {
 		// Same reason as PushStill: a JPEG inside a frame the dash parses as H.264 helps no one.
 		if ms.cb != nil {
-			go ms.cb.OnError("PushJpeg called on a session that did not negotiate JPEG", false)
+			ms.spawn(func() { ms.cb.OnError("PushJpeg called on a session that did not negotiate JPEG", false) })
 		}
 		logging.Printf("MobileSession: PushJpeg ignored, the dash was not answered JPEG\n")
 		return
