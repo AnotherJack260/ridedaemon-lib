@@ -1,6 +1,7 @@
 package net
 
 import (
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"io"
@@ -327,4 +328,61 @@ func TestTboxSerialIsAnsweredOnlyOffFlavor51(t *testing.T) {
 			}
 		})
 	}
+}
+
+// The owner's Zontes 350D (JCDZ21-E42b, flavor 51, channel 21321) end to end over TCP: what the
+// phone volunteers goes on the phone channel only, one command at a time, in the official app's
+// order - APPSTATUS 2 when the channel opens, CHECK_SN_RESULT, then at STREAM_START APPSTATUS 1
+// and switchEc2Front, and when the rider stops switchEc2Background and STOP_SERVICE.
+func TestZontesSessionGetsTheOfficialLifecycle(t *testing.T) {
+	keys, err := GenKeyPair()
+	if err != nil {
+		t.Fatal(err)
+	}
+	control := NewPXCControl("127.0.0.1:0", keys, &PhoneConfig{PxcVersion: "1.0.2"})
+	if err := control.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = control.Stop(ctx)
+	})
+
+	ctrl := dialDash(t, control, PxcHandshake)
+	writeDashFrame(t, ctrl, PxcHudConf, []byte(`{"HUID":"h","HUName":"JCDZ21-E42b","flavor":51,"channel":"21321","pxcVersion":"1.0.1"}`))
+	if got := readPXCResponse(t, ctrl); got.Command != PxcPhoneConf {
+		t.Fatalf("CLIENT_INFO answered 0x%x", got.Command)
+	}
+	data := dialDash(t, control, PxcChannelCarData)
+	expect := func(cmd uint32, body string) {
+		t.Helper()
+		got := readPXCResponse(t, data)
+		if got.Command != cmd || (body != "" && !strings.Contains(string(got.Body), body)) {
+			t.Fatalf("phone channel: 0x%x %s, want 0x%x %s", got.Command, got.Body, cmd, body)
+		}
+		writeDashFrame(t, data, cmd+1, nil)
+	}
+	expect(PxcAppStatus, `"mode":2`)
+
+	writeDashFrame(t, ctrl, PxcClientSet, []byte(`{"client_set":"easy_conn","sn":"S"}`))
+	if got := readPXCResponse(t, ctrl); got.Command != PxcCheckSnAck {
+		t.Fatalf("CHECK_SN answered 0x%x", got.Command)
+	}
+	expect(PxcCheckSnResult, `"isOk":true`)
+
+	// What core does on STREAM_START.
+	control.SendAppStatus(AppStatusMirrorLive)
+	control.SwitchEcToFront()
+	expect(PxcAppStatus, `"mode":1`)
+	expect(PxcSwitchEcToFront, "")
+
+	released := make(chan error, 1)
+	go func() { released <- control.ReleaseDash() }()
+	expect(PxcSwitchEcToBackground, "")
+	expect(PxcStopService, "")
+	if err := <-released; err != nil {
+		t.Fatalf("ReleaseDash() = %v", err)
+	}
+	assertSilent(t, ctrl, "the Zontes request channel")
 }
