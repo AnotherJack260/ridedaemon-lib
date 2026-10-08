@@ -53,3 +53,15 @@ func TestInitStreamCmdWithConnUsesProvidedConnection(t *testing.T) {
 		t.Fatalf("InitStreamCmdWithConn() error = %v", err)
 	}
 }
+
+// The official app reads the init reply by its length (sdk/s.java:852-866); a body without the
+// trailing newline used to fail the whole start.
+func TestECResponseNeedsNoTrailingNewline(t *testing.T) {
+	for _, body := range []string{`{"status":"true"}`, "{\"status\":\"true\"}\n"} {
+		packet := (&ECService{}).encodePayload(&ECResponse{Code: initOk, Separator: 0x70, Body: []byte(body)})
+		response, err := (&ECService{}).decodePayload(packet)
+		if err != nil || string(response.Body) != `{"status":"true"}` {
+			t.Fatalf("body %q: %v %q", body, err, response.Body)
+		}
+	}
+}
