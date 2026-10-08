@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	stdnet "net"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -208,5 +209,58 @@ func TestAStalledADBStreamIsClosed(t *testing.T) {
 	}
 	if device.stream(local) != nil {
 		t.Fatal("the stalled stream is still open")
+	}
+}
+
+// failingLink is an accessory link whose writes start failing while its reads still block.
+type failingLink struct {
+	stdnet.Conn
+	failing atomic.Bool
+}
+
+func (l *failingLink) Write(b []byte) (int, error) {
+	if l.failing.Load() {
+		return 0, errors.New("accessory write failed")
+	}
+	return l.Conn.Write(b)
+}
+
+// A link that fails a write is closed whichever stream's worker was writing - here the OKAY for a
+// WRTE - so Serve ends and closes every stream, instead of leaving the stream and its socket
+// behind while Serve waits on a read that never comes.
+func TestAFailedADBWriteEndsTheLink(t *testing.T) {
+	host, end := stdnet.Pipe()
+	defer host.Close()
+	_ = host.SetDeadline(time.Now().Add(3 * time.Second))
+	link := &failingLink{Conn: end}
+	services := make(chan stdnet.Conn, 1)
+	device := NewADBDevice(link)
+	device.Dial = func(string) (stdnet.Conn, error) {
+		phoneEnd, serviceEnd := stdnet.Pipe()
+		services <- serviceEnd
+		return phoneEnd, nil
+	}
+	served := make(chan error, 1)
+	go func() { served <- device.Serve() }()
+	writeADB(t, host, adbCNXN, 0x01000001, 4096, []byte("host::\x00"))
+	readADB(t, host)
+	writeADB(t, host, adbOPEN, 1, 0, []byte("tcp:10922\x00"))
+	local := readADB(t, host).arg0
+	service := <-services
+	defer service.Close()
+	_ = service.SetDeadline(time.Now().Add(3 * time.Second))
+
+	link.failing.Store(true)
+	writeADB(t, host, adbWRTE, 1, local, []byte("hi"))
+	if _, err := io.ReadFull(service, make([]byte, 2)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-served:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Serve kept waiting on a link that can no longer be written")
+	}
+	if _, err := service.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+		t.Fatalf("the stream's socket outlived the link: %v", err)
 	}
 }

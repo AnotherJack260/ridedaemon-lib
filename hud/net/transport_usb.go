@@ -201,7 +201,7 @@ func (d *ADBDevice) deliver(s *adbStream) {
 				return
 			}
 			if d.send(adbOKAY, s.local, s.remote, nil) != nil {
-				return // the link is failing; Serve closes everything
+				return // send closed the link; Serve closes everything
 			}
 		case <-s.done:
 			return
@@ -269,7 +269,8 @@ func (d *ADBDevice) closeAll() {
 	}
 }
 
-// send writes one packet: the checksum is filled in for every host version.
+// send writes one packet: the checksum is filled in for every host version. A link that fails a
+// write is closed, so Serve's read ends too and every stream with it, whoever was writing.
 func (d *ADBDevice) send(cmd, arg0, arg1 uint32, payload []byte) error {
 	packet := make([]byte, adbHeaderSize, adbHeaderSize+len(payload))
 	var sum uint32
@@ -285,6 +286,9 @@ func (d *ADBDevice) send(cmd, arg0, arg1 uint32, payload []byte) error {
 	d.writeMu.Lock()
 	defer d.writeMu.Unlock()
 	_, err := d.link.Write(append(packet, payload...))
+	if err != nil {
+		_ = d.link.Close()
+	}
 	return err
 }
 
