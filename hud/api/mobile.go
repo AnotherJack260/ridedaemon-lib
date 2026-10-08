@@ -212,11 +212,23 @@ func NewMobileSession(cfg *MobileConfig, cb MobileCallback) (*MobileSession, err
 	}
 	// 6 queued AUs ≈ 200ms at 30fps: absorbs producer/poll clock jitter without
 	// dropping frames of a predictive (GOP/intra-refresh) stream, while keeping
-	// worst-case buffered latency low. Overflow still drops the oldest AU.
+	// worst-case buffered latency low. Overflow drops up to the next IDR (PushFrame).
 	live := stream.NewLiveStreamSource(cfg.TargetFPS, 3*time.Second, 6)
 	// Before anything is pushed: the constructor arms an IDR wait that no JPEG can ever
 	// satisfy, so leaving it armed would drop every still in silence.
 	live.SetOpaquePayloads(cfg.JpegStillsEnabled)
+	// An overflowing queue now drops to the next IDR instead of smearing the picture; this
+	// tells the host to ask its encoder for one rather than wait for the GOP to come round.
+	live.OnKeyframeNeeded = func(dropped int) {
+		payload := make([]byte, 4)
+		binary.BigEndian.PutUint32(payload, uint32(dropped))
+		ms.relayEvent(core.HudEvent{
+			Source: core.EventSourceTransport,
+			Time:   time.Now(),
+			Cmd:    core.TransportCmdKeyframeNeeded,
+			Data:   payload,
+		})
+	}
 	ms.mux = &stream.MuxSource{NoSignal: static, Live: live}
 
 	// Build streamer

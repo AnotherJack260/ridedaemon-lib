@@ -106,3 +106,39 @@ func TestBuildAnnexBAUFromAVCCRejectsImpossibleLengths(t *testing.T) {
 		}
 	}
 }
+
+type transportCapture struct {
+	commands chan int
+}
+
+func (c *transportCapture) OnError(string, bool) {}
+func (c *transportCapture) OnEvent(_ int64, source int, command int, _ []byte) {
+	if source == int(core.EventSourceTransport) {
+		c.commands <- command
+	}
+}
+func (c *transportCapture) OnStopped() {}
+
+// The queue asking for a keyframe reaches the host as a transport event it can act on.
+func TestAnOverflowWithNoIDRAsksTheHostForAKeyframe(t *testing.T) {
+	callback := &transportCapture{commands: make(chan int, 4)}
+	session, err := NewMobileSession(NewMobileConfig(nil, 30, 10, 5, 10, 3), callback)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer session.StopSession()
+	idr := []byte{0, 0, 0, 1, 9, 0xf0, 0, 0, 0, 1, 0x65, 1}
+	p := []byte{0, 0, 0, 1, 9, 0xf0, 0, 0, 0, 1, 0x41, 1}
+	session.mux.Live.PushFrame(idr)
+	for i := 0; i < 6; i++ {
+		session.mux.Live.PushFrame(p)
+	}
+	select {
+	case command := <-callback.commands:
+		if command != core.TransportCmdKeyframeNeeded {
+			t.Fatalf("transport command = %d, want %d", command, core.TransportCmdKeyframeNeeded)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("the host was never asked for a keyframe")
+	}
+}

@@ -1,6 +1,7 @@
 package stream
 
 import (
+	"fmt"
 	"testing"
 	"time"
 )
@@ -120,4 +121,96 @@ func jpegStill(marker byte) []byte {
 
 func annexBAU(nalType byte) []byte {
 	return []byte{0, 0, 0, 1, 9, 0xf0, 0, 0, 0, 1, nalType, 1, 2, 3}
+}
+
+// taggedAU is an access unit of the given NAL type whose last byte names it.
+func taggedAU(nalType, tag byte) []byte {
+	return []byte{0, 0, 0, 1, 9, 0xf0, 0, 0, 0, 1, nalType, 1, 2, tag}
+}
+
+const idr, pFrame = 5, 1
+
+// When the queue must drop, it drops up to the next IDR so whatever goes out next decodes;
+// dropping one P-frame smeared the picture until the next IDR. JPEG stills still drop the oldest.
+func TestAnOverflowingQueueDropsUpToAnIDR(t *testing.T) {
+	type push struct{ nal, tag byte }
+	for _, tc := range []struct {
+		name       string
+		capacity   int
+		opaque     bool
+		pushes     []push
+		wantTags   []byte
+		wantAskFor []int
+	}{
+		{
+			name:     "an IDR is queued: drop the frames ahead of it",
+			capacity: 4,
+			pushes:   []push{{idr, 1}, {pFrame, 2}, {pFrame, 3}, {idr, 4}, {pFrame, 5}},
+			wantTags: []byte{4, 5},
+		},
+		{
+			name:       "no IDR queued: wait for one and ask for it",
+			capacity:   3,
+			pushes:     []push{{idr, 1}, {pFrame, 2}, {pFrame, 3}, {pFrame, 4}, {pFrame, 5}, {idr, 6}, {pFrame, 7}},
+			wantTags:   []byte{6, 7},
+			wantAskFor: []int{4},
+		},
+		{
+			name:     "the frame arriving is the IDR: nothing to ask for",
+			capacity: 3,
+			pushes:   []push{{idr, 1}, {pFrame, 2}, {pFrame, 3}, {idr, 4}},
+			wantTags: []byte{4},
+		},
+		{
+			name:     "JPEG stills drop the oldest",
+			capacity: 2,
+			opaque:   true,
+			pushes:   []push{{0, 1}, {0, 2}, {0, 3}},
+			wantTags: []byte{2, 3},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			source := NewLiveStreamSource(30, 3*time.Second, tc.capacity)
+			source.SetOpaquePayloads(tc.opaque)
+			var asked []int
+			source.OnKeyframeNeeded = func(dropped int) { asked = append(asked, dropped) }
+			for _, p := range tc.pushes {
+				if tc.opaque {
+					source.PushFrame(jpegStill(p.tag))
+				} else {
+					source.PushFrame(taggedAU(p.nal, p.tag))
+				}
+			}
+			var tags []byte
+			for i := 0; i < tc.capacity; i++ {
+				frame, _ := source.NextFrame(time.Now())
+				if frame == nil || (len(tags) > 0 && frame[len(frame)-1] == tags[len(tags)-1]) {
+					break // empty, or an IDR repeated for cadence
+				}
+				tags = append(tags, frame[len(frame)-1])
+			}
+			if string(tags) != string(tc.wantTags) {
+				t.Fatalf("sent %v, want %v", tags, tc.wantTags)
+			}
+			if fmt.Sprint(asked) != fmt.Sprint(tc.wantAskFor) {
+				t.Fatalf("asked for a keyframe %v, want %v", asked, tc.wantAskFor)
+			}
+		})
+	}
+}
+
+// One ask a second: a dash that stops polling overflows the queue every few frames, and an IDR
+// requested every 200 ms would be most of the bitrate.
+func TestKeyframeAsksAreRateLimited(t *testing.T) {
+	source := NewLiveStreamSource(30, 3*time.Second, 2)
+	asks := 0
+	source.OnKeyframeNeeded = func(int) { asks++ }
+	for round := 0; round < 3; round++ {
+		source.PushFrame(annexBAU(idr))
+		source.PushFrame(annexBAU(pFrame))
+		source.PushFrame(annexBAU(pFrame)) // overflow, nothing decodable left
+	}
+	if asks != 1 {
+		t.Fatalf("asked %d times in a burst, want 1", asks)
+	}
 }

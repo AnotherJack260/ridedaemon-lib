@@ -61,6 +61,11 @@ const TransportCmdPageSwitchProbe = 3
 // like any other response, which is what makes it worth reading.
 const TransportCmdAppStatusNotify = 4
 
+// TransportCmdKeyframeNeeded says the live video queue overflowed with no IDR left in it and
+// is dropping until the next one, so the host should ask its encoder for a sync frame now.
+// Payload: 4 bytes big-endian, how many access units were dropped. At most once a second.
+const TransportCmdKeyframeNeeded = 5
+
 type HudEvent struct {
 	Source HudEventSource
 	Time   time.Time

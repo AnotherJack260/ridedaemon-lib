@@ -8,6 +8,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/charliecharlieO-o/ridedaemon-go/internal/logging"
 )
 
 type FrameSource interface {
@@ -245,6 +247,13 @@ type LiveStreamSource struct {
 	// repeat on the way out. It exists for the dashboards that negotiate JPEG stills,
 	// where every payload is self-contained and the IDR rules would drop all of them.
 	opaque bool
+
+	// OnKeyframeNeeded, when set before the first push, is told that the queue overflowed
+	// with nothing decodable left in it and is now dropping until the next IDR, with how many
+	// AUs went. The host answers by asking its encoder for a sync frame. Called from PushFrame,
+	// outside the lock, at most once a second.
+	OnKeyframeNeeded func(dropped int)
+	lastKeyframeAsk  time.Time
 }
 
 func NewLiveStreamSource(targetFPS int, liveTimeout time.Duration, maxQ int) *LiveStreamSource {
@@ -291,23 +300,43 @@ func (s *LiveStreamSource) PushFrame(au []byte) {
 	}
 
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	dropped := s.pushLocked(au)
+	notify := s.OnKeyframeNeeded
+	s.mu.Unlock()
 
+	if dropped > 0 && notify != nil {
+		notify(dropped)
+	}
+}
+
+// pushLocked queues au and returns how many AUs it dropped to wait for an IDR, or 0.
+func (s *LiveStreamSource) pushLocked(au []byte) int {
 	now := time.Now()
 	s.active = true
 	s.lastInput = now
 	if s.awaitIDR && !s.opaque {
 		if !hasAnnexBNALType(au, 5) {
-			return
+			return 0
 		}
 		s.awaitIDR = false
 	}
 
 	if s.count == s.capacity {
-		// Drop the oldest frame
-		s.aus[s.head] = nil
-		s.head = (s.head + 1) % s.capacity
-		s.count--
+		if s.opaque {
+			// Every still is a whole picture: dropping the oldest loses nothing else.
+			s.dropHeadLocked()
+		} else if dropped := s.dropToIDRLocked(); s.count == 0 && !hasAnnexBNALType(au, 5) {
+			// Nothing left decodes without what was just dropped, and neither does this AU.
+			// The official app never gets here - one frame in flight per poll
+			// (base/q0.java:585-596, 713-721) - so the queue waits for an IDR and asks for one.
+			s.awaitIDR = true
+			logging.Printf("LiveStreamSource: queue overflowed with no IDR in it; dropped %d AUs, waiting for an IDR", dropped+1)
+			if now.Sub(s.lastKeyframeAsk) < time.Second {
+				return 0 // ponytail: one ask a second; the encoder's IDR is on its way
+			}
+			s.lastKeyframeAsk = now
+			return dropped + 1
+		}
 	}
 
 	buf := append([]byte(nil), au...) // copy buffer so memory can be reused
@@ -315,6 +344,26 @@ func (s *LiveStreamSource) PushFrame(au []byte) {
 	s.aus[s.tail] = buf
 	s.tail = (s.tail + 1) % s.capacity
 	s.count++
+	return 0
+}
+
+// dropToIDRLocked drops the oldest AU and every predicted AU behind it up to the next queued
+// IDR. It used to drop the oldest alone, which on a GOP stream smears the picture until the
+// next IDR: every frame after a lost P-frame predicts from a reference the dash never got
+// (the 2026-10-06 Zontes GOP test). Whatever goes out next now decodes.
+func (s *LiveStreamSource) dropToIDRLocked() int {
+	dropped := 0
+	for s.count > 0 && (dropped == 0 || !hasAnnexBNALType(s.aus[s.head], 5)) {
+		s.dropHeadLocked()
+		dropped++
+	}
+	return dropped
+}
+
+func (s *LiveStreamSource) dropHeadLocked() {
+	s.aus[s.head] = nil
+	s.head = (s.head + 1) % s.capacity
+	s.count--
 }
 
 // PrepareForConsumer clears stale predictive frames and waits for a fresh IDR.
