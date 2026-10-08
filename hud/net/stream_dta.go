@@ -20,6 +20,7 @@ type connectionState struct {
 	frameCounter   uint32
 	pollCount      uint64
 	lastPullReport time.Time
+	movie          bool // served in movie mode, chosen as the connection started
 }
 
 // VideoPullPhase says why a pull count is being reported, so the phone can tell the
@@ -436,7 +437,7 @@ func (s *MediaStream) handleConn(conn net.Conn) {
 		}
 
 		// Legacy pacing - 4B len + 4B idx + body
-		frame, idx := buildFramedPacket(body, st.frameCounter, s.indexed())
+		frame, idx := buildFramedPacket(body, st.frameCounter, s.indexed(st))
 		st.frameCounter = (st.frameCounter + 1) & 0x7FFFFFFF
 
 		// Send it chunked, send it paced
@@ -450,9 +451,11 @@ func (s *MediaStream) handleConn(conn net.Conn) {
 // indexed reports whether a frame carries the 4-byte index. A JPEG never does, nor does a movie-mode
 // frame, whatever the dash said about the extend protocol: Carbit writes length | JPEG
 // (base/q0.java:512-525) and, in movie mode, length | AU | timestamp (q0.java:641-651). Only an
-// H.264 frame outside movie mode keeps the format the host and the dash negotiated.
-func (s *MediaStream) indexed() bool {
-	return !s.plainFraming.Load() && !s.jpeg.Load() && !s.movieMode.Load()
+// H.264 frame outside movie mode keeps the format the host and the dash negotiated. Movie mode is
+// the connection's, fixed when it started, like the loop serving it: a 0x60 turning it on later
+// does not change the frames of a connection still polled.
+func (s *MediaStream) indexed(st *connectionState) bool {
+	return !s.plainFraming.Load() && !s.jpeg.Load() && !st.movie
 }
 
 // countPull counts one frame the dash asked for (in push and movie mode, where nothing is asked
@@ -483,7 +486,7 @@ func (s *MediaStream) nextFrame() []byte {
 func (s *MediaStream) writeWhole(output *bufio.Writer, st *connectionState, body []byte) error {
 	packet := []byte{0, 0, 0, 0}
 	if len(body) > 0 {
-		packet, _ = buildFramedPacket(body, st.frameCounter, s.indexed())
+		packet, _ = buildFramedPacket(body, st.frameCounter, s.indexed(st))
 		st.frameCounter = (st.frameCounter + 1) & 0x7FFFFFFF
 		s.countPull(st)
 	}
@@ -565,6 +568,7 @@ var movieClock = time.Now()
 // (q0.java:515-524), nor does an empty 00 00 00 00.
 func (s *MediaStream) serveMovieMode(conn net.Conn, input *bufio.Reader, output *bufio.Writer, st *connectionState, fail func(StrmErrorType, error)) {
 	logging.Printf("MediaStream: movie mode, sending frames as the dash grants them")
+	st.movie = true
 	var credits atomic.Int32
 	polled := make(chan struct{}, 1)
 	failed, exited := make(chan error, 1), make(chan struct{})

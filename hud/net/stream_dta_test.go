@@ -463,3 +463,25 @@ func TestJPEGFramesCarryNoIndex(t *testing.T) {
 		})
 	}
 }
+
+// Movie mode is decided as a connection starts (base/q0.java:1244-1274): a 0x60 that turns it on
+// while an H.264 connection is being polled leaves that connection's frames as they were, index
+// included, instead of half switching them.
+func TestMovieModeTurnedOnMidConnectionLeavesItsFramesAlone(t *testing.T) {
+	stream := NewMediaStream(":0", &queuedFrames{frames: [][]byte{testAccessUnit, testAccessUnit}}, 0x1000, 3*time.Millisecond)
+	stream.SetCaptureConfig(CaptureConfig{Encoder: 2})
+	conn, dash := net.Pipe()
+	defer conn.Close()
+	defer dash.Close()
+	serveVideoConn(t, stream, conn)
+	for i, movie := range []bool{false, true} {
+		stream.SetCaptureConfig(CaptureConfig{Encoder: 2, MovieMode: movie})
+		if _, err := dash.Write(videoPoll); err != nil {
+			t.Fatal(err)
+		}
+		frame := readVideo(t, dash, 8+len(testAccessUnit))
+		if binary.LittleEndian.Uint32(frame) != uint32(4+len(testAccessUnit)) || binary.LittleEndian.Uint32(frame[4:]) != uint32(i) {
+			t.Fatalf("polled frame %d (movie mode %v) = % x", i, movie, frame)
+		}
+	}
+}
