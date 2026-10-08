@@ -236,6 +236,17 @@ func asPEM(b []byte, blockType string) []byte {
 	return pem.EncodeToMemory(&pem.Block{Type: blockType, Bytes: b})
 }
 
+// SessionTLS is the configuration the dash's media control socket is served with, or nil while
+// this session is plaintext: CarbitRide upgrades that socket as it accepts it once PXC has
+// switched (common/base/t0.java:163-167, h0.s()), and a new request channel turns it off again.
+// The video socket stays plaintext, as it does there.
+func (s *PXCControl) SessionTLS() *tls.Config {
+	if s.tlsOn.Load() {
+		return s.tlsConfig
+	}
+	return nil
+}
+
 // SetTLSCertificate is what the phone serves when a dash asks for TLS. Configure it before Start.
 func (s *PXCControl) SetTLSCertificate(cert tls.Certificate) {
 	s.tlsConfig = &tls.Config{
@@ -273,6 +284,23 @@ type prefixedConn struct {
 }
 
 func (c *prefixedConn) Read(b []byte) (int, error) { return c.r.Read(b) }
+
+// startTLS makes c the server end of a TLS session over its socket, the handshake reading pending
+// (when not nil) before the socket, and handshakes now, within tlsHandshakeTimeout.
+func (c *pxcConn) startTLS(config *tls.Config, pending io.Reader) error {
+	r := io.Reader(c.Conn)
+	if pending != nil {
+		r = io.MultiReader(pending, c.Conn)
+	}
+	secure := tls.Server(&prefixedConn{Conn: c.Conn, r: r}, config)
+	_ = c.Conn.SetDeadline(time.Now().Add(tlsHandshakeTimeout))
+	defer func() { _ = c.Conn.SetDeadline(time.Time{}) }()
+	if err := secure.Handshake(); err != nil {
+		return err
+	}
+	c.secure.Store(secure)
+	return nil
+}
 
 // answerStartTLS answers 0x107C0; see the note above.
 func (s *PXCControl) answerStartTLS(event *PXCResponse, conn net.Conn) {
@@ -312,14 +340,9 @@ func (s *PXCControl) switchToTLS(conn net.Conn, reply *PXCResponse) bool {
 			return err
 		}
 		buffered, _ := state.reader.Peek(state.reader.Buffered())
-		pending := bytes.NewReader(append([]byte(nil), buffered...))
-		secure := tls.Server(&prefixedConn{Conn: c.Conn, r: io.MultiReader(pending, c.Conn)}, s.tlsConfig)
-		_ = c.Conn.SetDeadline(time.Now().Add(tlsHandshakeTimeout))
-		defer func() { _ = c.Conn.SetDeadline(time.Time{}) }()
-		if err := secure.Handshake(); err != nil {
+		if err := c.startTLS(s.tlsConfig, bytes.NewReader(append([]byte(nil), buffered...))); err != nil {
 			return err
 		}
-		c.secure.Store(secure)
 		state.reader.Reset(c)
 		return nil
 	}()

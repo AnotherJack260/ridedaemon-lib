@@ -277,3 +277,65 @@ func waitForPhoneChannel(t *testing.T, control *PXCControl, previous stdnet.Conn
 		}
 	}
 }
+
+// Once PXC has switched to TLS, the media control socket is accepted as TLS too and handshaken
+// before its first header, as CarbitRide upgrades it on accept (common/base/t0.java:163-167);
+// before that, and after a new request channel turns TLS off, it stays plaintext.
+func TestMediaControlFollowsTheSessionTLS(t *testing.T) {
+	control := startTLSControl(t, true)
+	media := NewMediaControl("127.0.0.1:0")
+	media.TLS = control.SessionTLS
+	if err := media.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = media.Stop(ctx)
+	})
+	dialMedia := func() stdnet.Conn {
+		conn, err := stdnet.Dial("tcp", media.listener.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = conn.Close() })
+		_ = conn.SetDeadline(time.Now().Add(5 * time.Second))
+		return conn
+	}
+	ping := func(conn stdnet.Conn) {
+		t.Helper()
+		if _, err := conn.Write([]byte{byte(MediaCtrlPing), 0, 0, 0, 0, 0, 0, 0}); err != nil {
+			t.Fatal(err)
+		}
+		reply := make([]byte, mediaCtrlHeaderSize)
+		if _, err := io.ReadFull(conn, reply); err != nil || reply[0] != byte(MediaCtrlPong) {
+			t.Fatalf("ping answered % x, %v", reply, err)
+		}
+	}
+	awaitTLS := func(on bool) {
+		t.Helper()
+		for deadline := time.Now().Add(2 * time.Second); (control.SessionTLS() != nil) != on; time.Sleep(time.Millisecond) {
+			if time.Now().After(deadline) {
+				t.Fatalf("SessionTLS on = %v, want %v", !on, on)
+			}
+		}
+	}
+
+	ping(dialMedia())
+
+	ctrl := dialDash(t, control, PxcHandshake)
+	writeDashFrame(t, ctrl, PxcStartTLS, nil)
+	readPXCResponse(t, ctrl)
+	dashTLS(t, ctrl)
+	awaitTLS(true)
+	ping(dashTLS(t, dialMedia()))
+
+	dialDash(t, control, PxcHandshake)
+	awaitTLS(false)
+	ping(dialMedia())
+	select {
+	case err := <-media.Errors:
+		t.Fatalf("media control error: %v", err)
+	default:
+	}
+}

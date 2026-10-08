@@ -639,6 +639,7 @@ func (hud *CfmotoHUD) startStream(ctx context.Context, initConn stdnet.Conn, aft
 		}
 	}()
 	mediaControl := net.NewMediaControl(":10921")
+	mediaControl.TLS = pxcServer.SessionTLS
 	mediaControl.SupportFunction = hud.supportFunction
 	mediaControl.JpegStills = hud.jpegStills
 	// STREAM_START is the latest moment that still precedes a single painted pixel: the

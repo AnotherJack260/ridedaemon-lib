@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -202,6 +203,11 @@ type MediaControl struct {
 	// whenever a 0x60 updates it. Called from the connection's goroutine.
 	OnCaptureConfig func(CaptureConfig)
 
+	// TLS, when set before Start, is asked as each connection is accepted whether the session is
+	// TLS now (PXCControl.SessionTLS); a non-nil answer makes the connection the server end of a
+	// TLS session, handshaken before its first header is read.
+	TLS func() *tls.Config
+
 	captureMu sync.Mutex
 	capture   *CaptureConfig
 }
@@ -301,7 +307,7 @@ func (s *MediaControl) acceptLoop() {
 
 		logging.Printf("New MediaControl client from %s", conn.RemoteAddr())
 		s.wg.Add(1)
-		go s.handleConn(conn)
+		go s.handleConn(&pxcConn{Conn: conn})
 	}
 }
 
@@ -548,8 +554,6 @@ func (s *MediaControl) handleConn(conn net.Conn) {
 		s.wg.Done()
 	}()
 
-	reader := bufio.NewReader(conn)
-
 	// Retire the connection before judging its failure, never after: when the dash goes away every
 	// channel fails at once and whichever one is judged last has to find an empty tracker.
 	fail := func(errType CtrlErrorType, cause error) {
@@ -559,6 +563,22 @@ func (s *MediaControl) handleConn(conn net.Conn) {
 		s.tracker.Remove(conn)
 		s.emitError(s.connectionError(conn, errType, cause))
 	}
+
+	if s.TLS != nil {
+		if config := s.TLS(); config != nil {
+			c, ok := conn.(*pxcConn)
+			if !ok {
+				fail(CtrlDecodeErr, errors.New("this connection cannot switch to TLS"))
+				return
+			}
+			if err := c.startTLS(config, nil); err != nil {
+				fail(CtrlDecodeErr, fmt.Errorf("TLS on media control: %w", err))
+				return
+			}
+			logging.Printf("MediaControl: %v is TLS", conn.RemoteAddr())
+		}
+	}
+	reader := bufio.NewReader(conn)
 
 	logging.Printf("Starting StreamCtrl Loop")
 	defer logging.Printf("Stopping StreamCtrl Loop")
