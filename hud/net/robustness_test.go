@@ -274,19 +274,28 @@ func TestEveryZontesCommandIsAnsweredLikeTheOfficialApp(t *testing.T) {
 	}
 }
 
-// CAR_SUPPORT_CMDS is acked empty, or answered 0x80000020 when the body is not a JSON object,
-// as km/h.java:22-36 does.
+// CAR_SUPPORT_CMDS is acked empty, or - to a flavor-51 dash - answered 0x80000020 when the body
+// is not a JSON object, null included, as km/h.java:22-36 does. Any other dash keeps the empty ack.
 func TestCarSupportCmdsIsAnsweredLikeTheOfficialApp(t *testing.T) {
 	for _, tc := range []struct {
 		name, body string
+		flavor51   bool
 		want       uint32
 	}{
-		{"a JSON object", `{"cmds":[131344,131600]}`, PxcCarSupportCmds + 1},
-		{"no body", ``, PxcCarSupportCmds + 1},
-		{"not JSON", `131344,131600`, PxcStatusError},
+		{"a JSON object", `{"cmds":[131344,131600]}`, true, PxcCarSupportCmds + 1},
+		{"no body", ``, true, PxcCarSupportCmds + 1},
+		{"not JSON", `131344,131600`, true, PxcStatusError},
+		{"null", `null`, true, PxcStatusError},
+		{"a JSON array", `[131344]`, true, PxcStatusError},
+		{"not JSON, another flavor", `131344,131600`, false, PxcCarSupportCmds + 1},
+		{"null, another flavor", `null`, false, PxcCarSupportCmds + 1},
+		{"a JSON object, another flavor", `{"cmds":[]}`, false, PxcCarSupportCmds + 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			control := NewPXCControl(":0", nil, nil)
+			if tc.flavor51 {
+				control = flavor51Control("21321")
+			}
 			got := handlePXCEventAndReadResponses(t, control, &PXCResponse{Command: PxcCarSupportCmds, Body: json.RawMessage(tc.body)}, 1)[0]
 			if got.Command != tc.want || len(got.Body) != 0 {
 				t.Fatalf("reply = 0x%x %q, want 0x%x", got.Command, got.Body, tc.want)

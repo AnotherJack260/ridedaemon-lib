@@ -95,14 +95,15 @@ var pxcCannedReplies = map[uint32]json.RawMessage{
 
 func init() {
 	// CarbitRide parses the list and does nothing else with it - ec/b.java has no G() override -
-	// so the empty ack is its whole answer; a body that is not a JSON object is a handler error
-	// (km/h.java:22-36). The request itself reaches the host's event stream as usual.
-	RegisterC2PHandler(PxcCarSupportCmds, func(_ *PXCControl, req *PXCResponse) ([]byte, error) {
-		if len(req.Body) == 0 {
-			return nil, nil
+	// so the empty ack is its whole answer; a body that is not a JSON object, null included, is a
+	// handler error (km/h.java:22-36). Only for flavor 51, as for the feature commands: any other
+	// dash keeps the empty ack the default branch always gave it. The request itself reaches the
+	// host's event stream as usual.
+	RegisterC2PHandler(PxcCarSupportCmds, func(s *PXCControl, req *PXCResponse) ([]byte, error) {
+		if _, err := optObject(req.Body); err != nil && s.flavor51Defaults() {
+			return nil, err
 		}
-		var cmds map[string]json.RawMessage
-		return nil, json.Unmarshal(req.Body, &cmds)
+		return nil, nil
 	})
 }
 
