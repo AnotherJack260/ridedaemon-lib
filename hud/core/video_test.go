@@ -41,8 +41,8 @@ func TestCaptureConfigReachesTheQueueTheHostAndTheGetter(t *testing.T) {
 	}
 }
 
-// Only a dash that polls for H.264 gets the deep queue: 20 frames it has not pulled yet are all
-// still there. A pushed or movie-mode dash keeps the 6-AU queue, which has overflowed by then.
+// Only a dash that pulls (polls, or movie-mode credits) gets the deep queue: 20 frames it has not
+// pulled yet are all still there. A pushed dash keeps the 6-AU queue, which has overflowed by then.
 func TestOnlyAPollingDashGetsTheDeepQueue(t *testing.T) {
 	for _, tc := range []struct {
 		config net.CaptureConfig
@@ -50,7 +50,7 @@ func TestOnlyAPollingDashGetsTheDeepQueue(t *testing.T) {
 	}{
 		{net.CaptureConfig{WantFps: 0, Encoder: 2}, 20},
 		{net.CaptureConfig{WantFps: 30, Encoder: 2}, 0},
-		{net.CaptureConfig{WantFps: 0, Encoder: 2, MovieMode: true}, 0},
+		{net.CaptureConfig{WantFps: 0, Encoder: 2, MovieMode: true}, 20},
 	} {
 		live := stream.NewLiveStreamSource(30, 3*time.Second, 6)
 		hud := NewCfmotoHUD(30, &stream.MuxSource{Live: live}, 0)

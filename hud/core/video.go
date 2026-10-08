@@ -42,7 +42,10 @@ func (hud *CfmotoHUD) wireVideo(mc *net.MediaControl, ms *net.MediaStream) {
 	mc.OnCaptureConfig = func(c net.CaptureConfig) {
 		ms.SetCaptureConfig(c)
 		hud.muxSource.SetLiveOpaque(c.Encoder == 1)
-		hud.muxSource.SetLivePollMode(c.WantFps == 0 && !c.MovieMode) // as MediaStream.handleConn picks the loop
+		// Every pull-driven dash gets the deep queue, movie mode included (it pulls by credits): a
+		// late 0x60 turning movie mode on must not shrink the queue under a poll-mode connection
+		// that is already being served (Codex review, 2026-10-08).
+		hud.muxSource.SetLivePollMode(c.WantFps == 0)
 		hud.video.capture.Store(&c)
 		payload, _ := json.Marshal(c)
 		hud.handleServerEvent(HudEvent{
