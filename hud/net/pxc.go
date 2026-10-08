@@ -333,6 +333,72 @@ type PXCControl struct {
 	// HeardElsewhere, when set before Start, reports the last time the dash said anything
 	// outside PXC - a video poll - so a dash still pulling frames is never judged dead.
 	HeardElsewhere func() time.Time
+	// OnTransport, when set before Start, receives this package's typed transport events
+	// (emitTransport). The host sees them as EventSourceTransport events with this cmd.
+	OnTransport func(cmd int, payload []byte)
+}
+
+// C2PHandler answers one request the dash sends on PXC (an even command), for a command the
+// switch in handleEvent does not name. It returns the body of the cmd+1 reply - nil for an empty
+// one, which is what CarbitRide answers nearly every command it handles with (v0.d(),
+// sdk/v0.java:50-66). An error is answered 0x80000020 {"errCode":-2147483648,"errMsg":...}, as
+// CarbitRide answers a handler that failed, typically on a body that is not JSON
+// (sdk/b1.java:126-144, om/c.java:24-37).
+//
+// It runs on the connection's reader goroutine before the reply is written: it must not block.
+// The request already reached the event stream; emitTransport is for a decoded, typed event.
+type C2PHandler func(s *PXCControl, req *PXCResponse) (reply []byte, err error)
+
+var (
+	c2pHandlersMu sync.RWMutex
+	c2pHandlers   = map[uint32]C2PHandler{}
+)
+
+// RegisterC2PHandler makes h the answer to dash command cmd. Call it from an init() in the file
+// that owns the command. A command the dispatch switch names itself cannot be taken over, and a
+// command registered twice is a programming error.
+func RegisterC2PHandler(cmd uint32, h C2PHandler) {
+	c2pHandlersMu.Lock()
+	defer c2pHandlersMu.Unlock()
+	if _, dup := c2pHandlers[cmd]; dup {
+		panic(fmt.Sprintf("C2P handler for 0x%x registered twice", cmd))
+	}
+	c2pHandlers[cmd] = h
+}
+
+func c2pHandler(cmd uint32) C2PHandler {
+	c2pHandlersMu.RLock()
+	defer c2pHandlersMu.RUnlock()
+	return c2pHandlers[cmd]
+}
+
+// pxcCmdError is the errCode CarbitRide puts in 0x80000020 for a handler that threw:
+// C.RATE_UNSET_INT, Integer.MIN_VALUE (km/h.java:30-34).
+const pxcCmdError = -2147483648
+
+// emitTransport hands the host one typed transport event; see OnTransport.
+func (s *PXCControl) emitTransport(cmd int, payload []byte) {
+	if s.OnTransport != nil {
+		s.OnTransport(cmd, payload)
+	}
+}
+
+// answerRegistered runs a registered handler and writes its reply on the connection it came in on.
+func (s *PXCControl) answerRegistered(h C2PHandler, event *PXCResponse, conn net.Conn) {
+	s.emitEvent(*event)
+	response := &PXCResponse{Command: event.Command + 1}
+	body, err := h(s, event)
+	if err != nil {
+		logging.Printf("PXC 0x%x: %v; answering 0x%x", event.Command, err, PxcStatusError)
+		body, _ = json.Marshal(map[string]any{"errCode": pxcCmdError, "errMsg": err.Error()})
+		response.Command = PxcStatusError
+	}
+	response.Body = body
+	if err := s.writeResponse(response, conn, nil); err != nil {
+		s.emitError(s.connectionError(conn, PxcWriteErr, err))
+	} else if body != nil {
+		s.emitEvent(*response)
+	}
 }
 
 type pxcConnectionState struct {
@@ -915,7 +981,9 @@ func (s *PXCControl) handleEvent(event *PXCResponse, conn net.Conn) {
 		// a rider's own diagnostics export can ever show the reply happened.
 		s.emitEvent(*response)
 	default:
-		if event.Command&1 == 0 {
+		if h := c2pHandler(event.Command); h != nil && event.Command&1 == 0 {
+			s.answerRegistered(h, event, conn)
+		} else if event.Command&1 == 0 {
 			// Unknown even commands are requests. CFDL26 uses several JSON and
 			// binary notifications here and will not open 10921/10920 until ACKed.
 			//

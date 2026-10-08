@@ -66,6 +66,9 @@ const TransportCmdAppStatusNotify = 4
 // Payload: 4 bytes big-endian, how many access units were dropped. At most once a second.
 const TransportCmdKeyframeNeeded = 5
 
+// Transport events that report a dash request carry that request's PXC command number, so a
+// feature added in hud/net (RegisterC2PHandler + emitTransport) never needs a number from here.
+
 type HudEvent struct {
 	Source HudEventSource
 	Time   time.Time
@@ -487,6 +490,9 @@ func (hud *CfmotoHUD) startStream(ctx context.Context, initConn stdnet.Conn) (er
 			Cmd:    TransportCmdAppStatusNotify,
 			Data:   payload,
 		})
+	}
+	pxcServer.OnTransport = func(cmd int, payload []byte) {
+		hud.handleServerEvent(HudEvent{Source: EventSourceTransport, Time: time.Now(), Cmd: cmd, Data: payload})
 	}
 	pxcServer.SetTimeZoneID(hud.timeZoneID)
 	if hud.timeZoneOffsetSet {
