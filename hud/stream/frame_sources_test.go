@@ -1,6 +1,7 @@
 package stream
 
 import (
+	"bytes"
 	"fmt"
 	"testing"
 	"time"
@@ -244,5 +245,48 @@ func TestASuppressedKeyframeAskIsRepeatedWhileTheIDRIsOwed(t *testing.T) {
 	source.PushFrame(annexBAU(pFrame))
 	if len(asked) != 2 {
 		t.Fatalf("asked again after the IDR arrived: %v", asked)
+	}
+}
+
+// A capture codec change mid-session (core's OnCaptureConfig) drops what the old codec left queued
+// or kept for a repeat, and a switch back to H.264 waits for an IDR again; the same codec again
+// changes nothing.
+func TestACodecChangeDropsTheOldCodecsFrames(t *testing.T) {
+	live := NewLiveStreamSource(30, 3*time.Second, 6)
+	idr := []byte{0, 0, 0, 1, 0x65, 0x88}
+	p := []byte{0, 0, 0, 1, 0x41, 0x9A}
+	jpeg := []byte{0xFF, 0xD8, 0xFF, 0xD9}
+	next := func() []byte {
+		frame, _ := live.NextFrame(time.Now())
+		return frame
+	}
+
+	live.PushFrame(idr)
+	live.PushFrame(p)
+	live.SetOpaquePayloads(false) // still H.264
+	if frame := next(); !bytes.Equal(frame, idr) {
+		t.Fatalf("re-stating the codec dropped the queue: %x", frame)
+	}
+
+	live.SetOpaquePayloads(true)
+	if frame := next(); frame != nil {
+		t.Fatalf("an H.264 frame went to a dash now expecting JPEG: %x", frame)
+	}
+	live.PushFrame(jpeg)
+	if frame := next(); !bytes.Equal(frame, jpeg) {
+		t.Fatalf("the first still = %x", frame)
+	}
+
+	live.SetOpaquePayloads(false)
+	if frame := next(); frame != nil {
+		t.Fatalf("a still was repeated to a dash now expecting H.264: %x", frame)
+	}
+	live.PushFrame(p)
+	if frame := next(); frame != nil {
+		t.Fatalf("H.264 restarted on a P-frame: %x", frame)
+	}
+	live.PushFrame(idr)
+	if frame := next(); !bytes.Equal(frame, idr) {
+		t.Fatalf("H.264 did not restart on the IDR: %x", frame)
 	}
 }

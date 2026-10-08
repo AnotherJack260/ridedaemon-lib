@@ -283,15 +283,16 @@ func NewLiveStreamSource(targetFPS int, liveTimeout time.Duration, maxQ int) *Li
 }
 
 // SetOpaquePayloads switches the source to forwarding whole self-contained payloads -
-// JPEG stills - instead of H.264 access units. Call it before the first push: it also
-// disarms the IDR wait the constructor armed, which would otherwise silently drop every
-// still ever pushed, since no JPEG carries a NAL of type 5.
+// JPEG stills - instead of H.264 access units, or back. A switch drops everything queued or
+// kept for a repeat, none of which the new codec can decode, and sets the IDR wait for the new
+// one: off for stills, which carry no NAL of type 5 and would otherwise all be dropped, on for
+// H.264, which must start at an IDR. The same setting again changes nothing.
 func (s *LiveStreamSource) SetOpaquePayloads(enabled bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.opaque = enabled
-	if enabled {
-		s.awaitIDR = false
+	if enabled != s.opaque {
+		s.opaque = enabled
+		s.clearLocked()
 	}
 }
 
@@ -390,7 +391,10 @@ func (s *LiveStreamSource) dropHeadLocked() {
 func (s *LiveStreamSource) PrepareForConsumer() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.clearLocked()
+}
 
+func (s *LiveStreamSource) clearLocked() {
 	for i := range s.aus {
 		s.aus[i] = nil
 	}
