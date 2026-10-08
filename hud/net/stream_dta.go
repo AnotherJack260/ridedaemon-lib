@@ -152,6 +152,10 @@ type MediaStream struct {
 	// host must not block in it.
 	OnVideoPulls func(phase VideoPullPhase, pulls uint64)
 
+	// mcuLite takes the data socket of an MCU-Lite dash, which speaks its own frame protocol on
+	// this port (transport_mcu_lite.go). Nil unless the host enabled MCU-Lite.
+	mcuLite *MCULite
+
 	// Interface events
 	Errors chan error
 }
@@ -278,6 +282,9 @@ func (s *MediaStream) acceptLoop() {
 		}
 
 		logging.Printf("New MediaStream client from %s", conn.RemoteAddr())
+		if s.mcuLite.claimData(conn) {
+			continue
+		}
 		s.wg.Add(1)
 		go s.handleConn(conn)
 	}

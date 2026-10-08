@@ -333,6 +333,9 @@ type PXCControl struct {
 	// HeardElsewhere, when set before Start, reports the last time the dash said anything
 	// outside PXC - a video poll - so a dash still pulling frames is never judged dead.
 	HeardElsewhere func() time.Time
+
+	// mcuLite answers the MCU-Lite family on this port when the host enabled it (SetMCULite).
+	mcuLite *MCULite
 }
 
 type pxcConnectionState struct {
@@ -934,6 +937,10 @@ func (s *PXCControl) handleEvent(event *PXCResponse, conn net.Conn) {
 		// a rider's own diagnostics export can ever show the reply happened.
 		s.emitEvent(*response)
 	default:
+		// The other EasyConn families sharing this port: MCU-Lite, MCU, VM (transport_families.go).
+		if s.serveOtherFamily(event, conn) {
+			break
+		}
 		if event.Command&1 == 0 {
 			// Unknown even commands are requests. CFDL26 uses several JSON and
 			// binary notifications here and will not open 10921/10920 until ACKed.
