@@ -43,6 +43,10 @@ const (
 	adbMaxData = 256 * 1024
 	// adbBanner is jadbd's CNXN reply.
 	adbBanner = "device::ro.product.name=jadbd"
+	// adbInbound bounds the host's WRTEs waiting for one stream's local socket. adb's flow control
+	// keeps one in flight until its OKAY (and the banner offers no delayed ack); more waiting than
+	// this means the socket has stopped taking them.
+	adbInbound = 16
 )
 
 // ADBDevice serves the head unit's adb streams over one accessory link.
@@ -65,6 +69,7 @@ type adbStream struct {
 	local, remote uint32
 	conn          net.Conn
 	ready         chan struct{} // the host's OKAY: the next WRTE may go
+	inbound       chan []byte   // the host's WRTEs for deliver; nil asks it to close the stream
 	done          chan struct{}
 }
 
@@ -124,18 +129,21 @@ func (d *ADBDevice) Serve() error {
 				}
 				continue
 			}
-			// ponytail: written inline, so a stalled local socket stalls the link; loopback
-			// buffers are far larger than the dash's requests.
-			if _, err := s.conn.Write(payload); err != nil {
+			// The stream's own writer takes it: a local socket that stops reading stalls only its
+			// stream, never the link every other stream shares.
+			select {
+			case s.inbound <- payload:
+			default:
+				logging.Printf("adb: stream %d stopped taking data; closing it", s.local)
 				d.closeStream(s, true)
-				continue
-			}
-			if err := d.send(adbOKAY, s.local, s.remote, nil); err != nil {
-				return err
 			}
 		case adbCLSE:
 			if s := d.stream(arg1); s != nil {
-				d.closeStream(s, false)
+				select {
+				case s.inbound <- nil: // after what the host wrote before it
+				default:
+					d.closeStream(s, false)
+				}
 			}
 		default:
 			logging.Printf("adb: ignoring packet 0x%x", cmd)
@@ -155,14 +163,39 @@ func (d *ADBDevice) open(remote uint32, service string) error {
 	}
 	d.mu.Lock()
 	d.nextID++
-	s := &adbStream{local: d.nextID, remote: remote, conn: conn, ready: make(chan struct{}, 1), done: make(chan struct{})}
+	s := &adbStream{local: d.nextID, remote: remote, conn: conn, ready: make(chan struct{}, 1),
+		inbound: make(chan []byte, adbInbound), done: make(chan struct{})}
 	d.streams[s.local] = s
 	d.mu.Unlock()
 	if err := d.send(adbOKAY, s.local, remote, nil); err != nil {
 		return err
 	}
 	go d.pump(s)
+	go d.deliver(s)
 	return nil
+}
+
+// deliver writes the host's WRTEs on one stream to its local socket, in order, answering each with
+// OKAY once the socket has taken it - which is what keeps the host from sending the next.
+func (d *ADBDevice) deliver(s *adbStream) {
+	for {
+		select {
+		case payload := <-s.inbound:
+			if payload == nil {
+				d.closeStream(s, false)
+				return
+			}
+			if _, err := s.conn.Write(payload); err != nil {
+				d.closeStream(s, true)
+				return
+			}
+			if d.send(adbOKAY, s.local, s.remote, nil) != nil {
+				return // the link is failing; Serve closes everything
+			}
+		case <-s.done:
+			return
+		}
+	}
 }
 
 // pump copies what the phone-side service writes to the host, one WRTE at a time, each waiting

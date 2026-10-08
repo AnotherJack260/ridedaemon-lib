@@ -126,3 +126,57 @@ func TestPXCOverTheADBTunnel(t *testing.T) {
 		t.Fatal("Serve did not return when the link closed")
 	}
 }
+
+// A stream whose local socket stops reading stalls only itself: its WRTE waits unacked while
+// another stream's data still goes through and is acked, and a CLSE right behind a WRTE still
+// lets that WRTE's bytes reach the socket first.
+func TestAStalledADBStreamDoesNotStallTheLink(t *testing.T) {
+	host, link := stdnet.Pipe()
+	defer host.Close()
+	_ = host.SetDeadline(time.Now().Add(3 * time.Second))
+	services := make(chan stdnet.Conn, 2)
+	device := NewADBDevice(link)
+	device.Dial = func(string) (stdnet.Conn, error) {
+		phoneEnd, serviceEnd := stdnet.Pipe()
+		services <- serviceEnd
+		return phoneEnd, nil
+	}
+	go func() { _ = device.Serve() }()
+	writeADB(t, host, adbCNXN, 0x01000001, 4096, []byte("host::\x00"))
+	readADB(t, host)
+	open := func(id uint32) (uint32, stdnet.Conn) {
+		writeADB(t, host, adbOPEN, id, 0, []byte("tcp:10920\x00"))
+		okay := readADB(t, host)
+		if okay.cmd != adbOKAY || okay.arg1 != id {
+			t.Fatalf("OPEN answered 0x%x", okay.cmd)
+		}
+		service := <-services
+		t.Cleanup(func() { _ = service.Close() })
+		_ = service.SetDeadline(time.Now().Add(3 * time.Second))
+		return okay.arg0, service
+	}
+	stalled, _ := open(1) // its service never reads
+	live, service := open(2)
+
+	writeADB(t, host, adbWRTE, 1, stalled, []byte("stuck"))
+	writeADB(t, host, adbWRTE, 2, live, []byte("hello"))
+	got := make([]byte, 5)
+	if _, err := io.ReadFull(service, got); err != nil || string(got) != "hello" {
+		t.Fatalf("the live stream got %q, %v", got, err)
+	}
+	if p := readADB(t, host); p.cmd != adbOKAY || p.arg0 != live || p.arg1 != 2 {
+		t.Fatalf("after the live stream's write: 0x%x %d %d", p.cmd, p.arg0, p.arg1)
+	}
+
+	writeADB(t, host, adbWRTE, 2, live, []byte("bye"))
+	writeADB(t, host, adbCLSE, 2, live, nil)
+	if _, err := io.ReadFull(service, got[:3]); err != nil || string(got[:3]) != "bye" {
+		t.Fatalf("the write before CLSE got %q, %v", got[:3], err)
+	}
+	if p := readADB(t, host); p.cmd != adbOKAY || p.arg0 != live {
+		t.Fatalf("after the last write: 0x%x %d %d", p.cmd, p.arg0, p.arg1)
+	}
+	if _, err := service.Read(got); !errors.Is(err, io.EOF) {
+		t.Fatalf("the closed stream's socket: %v", err)
+	}
+}
