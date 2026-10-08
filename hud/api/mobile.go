@@ -120,10 +120,14 @@ type MobileConfig struct {
 	JpegStillsEnabled bool
 	// AppStatusNotifyEnabled makes the phone push ECP_P2C_APPSTATUS_BACKGROUND the way
 	// the official EasyConn app does: once when PXC comes up, and again - as "the
-	// mirror is live" - when the dash starts pulling frames. It is the only statement
-	// the official app ever volunteers that a mirror exists, and no reference
-	// implementation sends it. Off for every dashboard that paints a picture today.
-	// See net.PXCControl.SetAppStatusNotify.
+	// mirror is live" - when the dash starts pulling frames (0x20020 instead while
+	// SetAppForeground says the app is in front). It is the only statement the official
+	// app ever volunteers that a mirror exists, and no reference implementation sends it.
+	//
+	// A flavor-51 dash (CarbitRide's family, the Zontes 350D among them) gets it by default
+	// whatever this says, with the rest of the official lifecycle; SetFlavor51Lifecycle(false)
+	// is the kill switch that restores the earlier wire. For every other dash it stays off
+	// unless this is set. See net.PXCControl.SetAppStatusNotify.
 	AppStatusNotifyEnabled bool
 	// PhoneScreenWidth, PhoneScreenHeight and PhoneScreenRotation are the phone's own
 	// display metrics, carried inside that notification exactly as the official app
