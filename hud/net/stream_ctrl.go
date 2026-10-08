@@ -614,9 +614,12 @@ func (s *MediaControl) handleConn(conn net.Conn) {
 	}
 }
 
+// SetListener makes Start serve ln instead of listening on its port, for a host or a test that
+// owns the socket. Stop closes it. Configure it before Start.
+func (s *MediaControl) SetListener(ln net.Listener) { s.listener = ln }
+
 func (s *MediaControl) Start() error {
-	// Create listener
-	ln, err := net.Listen("tcp", s.port)
+	ln, err := listenOn(s.listener, s.port)
 	if err != nil {
 		return err
 	}

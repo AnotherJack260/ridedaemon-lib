@@ -611,9 +611,12 @@ func (s *MediaStream) serveMovieMode(conn net.Conn, input *bufio.Reader, output 
 	}
 }
 
+// SetListener makes Start serve ln instead of listening on its port, for a host or a test that
+// owns the socket. Stop closes it. Configure it before Start.
+func (s *MediaStream) SetListener(ln net.Listener) { s.listener = ln }
+
 func (s *MediaStream) Start() error {
-	// Create listener
-	ln, err := net.Listen("tcp", s.port)
+	ln, err := listenOn(s.listener, s.port)
 	if err != nil {
 		return err
 	}

@@ -1317,9 +1317,12 @@ func (s *PXCControl) clientInfoReply(body []byte) ([]byte, error) {
 	return json.Marshal(s.PhoneConfig)
 }
 
+// SetListener makes Start serve ln instead of listening on its port, for a host or a test that
+// owns the socket. Stop closes it. Configure it before Start.
+func (s *PXCControl) SetListener(ln net.Listener) { s.listener = ln }
+
 func (s *PXCControl) Start() error {
-	// Create listener
-	ln, err := net.Listen("tcp", s.port)
+	ln, err := listenOn(s.listener, s.port)
 	if err != nil {
 		return err
 	}

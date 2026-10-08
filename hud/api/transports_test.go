@@ -151,21 +151,41 @@ func pxc(cmd uint32, body []byte) []byte {
 	return append(f, body...)
 }
 
+// useEphemeralPorts serves the session on loopback listeners the test holds from now until the
+// session stops them, and routes the adb tunnel's tcp:10922/10921/10920 there: no fixed port to
+// race another process for, and nothing to skip.
+func useEphemeralPorts(t *testing.T, session *MobileSession) {
+	t.Helper()
+	listeners := map[string]stdnet.Listener{}
+	for _, service := range []string{"tcp:10922", "tcp:10921", "tcp:10920"} {
+		ln, err := stdnet.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = ln.Close() })
+		listeners[service] = ln
+	}
+	if err := session.hud.SetListeners(listeners["tcp:10922"], listeners["tcp:10921"], listeners["tcp:10920"]); err != nil {
+		t.Fatal(err)
+	}
+	session.usbDial = func(service string) (stdnet.Conn, error) {
+		ln, ok := listeners[service]
+		if !ok {
+			return nil, errors.New("no such service")
+		}
+		return stdnet.Dial("tcp", ln.Addr().String())
+	}
+}
+
 // An MCU-Lite dash over USB, end to end through a real session: adb on the accessory stream,
 // the PXC handshake on the phone's own listener, the session ready on ClientInfo, the mirror
 // config reaching the host, and a still pulled through the data port.
 func TestMCULiteOverUSB(t *testing.T) {
-	for _, port := range []string{":10920", ":10921", ":10922"} {
-		ln, err := stdnet.Listen("tcp", port)
-		if err != nil {
-			t.Skipf("the session ports are busy on this machine: %v", err)
-		}
-		_ = ln.Close()
-	}
 	session, err := NewMobileSession(NewMobileConfig(nil, 30, 5, 2, 1, 1), silentCallback{})
 	if err != nil {
 		t.Fatal(err)
 	}
+	useEphemeralPorts(t, session)
 	mirrors := make(chan [3]int, 1)
 	if err := session.EnableMCULite(liteCallback{mirrors}); err != nil {
 		t.Fatal(err)

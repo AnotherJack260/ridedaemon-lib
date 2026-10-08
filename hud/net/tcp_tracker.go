@@ -10,6 +10,14 @@ type ConnTracker struct {
 	connections map[net.Conn]struct{}
 }
 
+// listenOn is preset when a server was handed one (SetListener), else a new listener on port.
+func listenOn(preset net.Listener, port string) (net.Listener, error) {
+	if preset != nil {
+		return preset, nil
+	}
+	return net.Listen("tcp", port)
+}
+
 func NewConnTracker() *ConnTracker {
 	return &ConnTracker{
 		connections: make(map[net.Conn]struct{}),

@@ -72,6 +72,7 @@ func (ms *MobileSession) StartSessionOverUSB(accessory Stream) error {
 	}
 	link := &streamRW{s: accessory}
 	device := net.NewADBDevice(link)
+	device.Dial = ms.usbDial
 	device.OnBanner = func(banner string) {
 		ms.relayEvent(core.HudEvent{
 			Source: core.EventSourceTransport,

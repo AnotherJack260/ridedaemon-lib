@@ -260,18 +260,12 @@ func awaitEvent(t *testing.T, events chan pxcEvent, source, cmd int) pxcEvent {
 // cmd+1, the app still gets it from OnEvent as source PXC with its body, as before the feature
 // handlers were registered, and the session hands it to its DashFeatures without the app.
 func TestFeatureCommandReachesOnEventThroughTheRegistry(t *testing.T) {
-	for _, port := range []string{":10920", ":10921", ":10922"} {
-		ln, err := stdnet.Listen("tcp", port)
-		if err != nil {
-			t.Skipf("the session ports are busy on this machine: %v", err)
-		}
-		_ = ln.Close()
-	}
 	cb := eventsCallback{make(chan pxcEvent, 64)}
 	session, err := NewMobileSession(NewMobileConfig(nil, 30, 5, 2, 1, 1), cb)
 	if err != nil {
 		t.Fatal(err)
 	}
+	useEphemeralPorts(t, session)
 	keys := make(chan [3]int, 1)
 	NewDashFeatures(session, keyListener{keys: keys})
 	hostEnd, deviceEnd := stdnet.Pipe()

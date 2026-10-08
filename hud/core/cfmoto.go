@@ -129,6 +129,8 @@ type CfmotoHUD struct {
 	mediaControl *net.MediaControl
 	mediaStream  *net.MediaStream
 	mcuLite      *net.MCULite // nil unless the host enabled MCU-Lite (transports.go)
+	// listeners, when set, are served instead of 10922, 10921 and 10920; see SetListeners.
+	listeners []stdnet.Listener
 
 	// Streaming
 	muxSource *stream.MuxSource
@@ -246,6 +248,19 @@ func (hud *CfmotoHUD) SetTLSCertificate(cert tls.Certificate) error {
 		return errors.New("already running")
 	}
 	hud.tlsCert = &cert
+	return nil
+}
+
+// SetListeners makes the next session serve PXC, media control and the video on these listeners
+// instead of listening on 10922, 10921 and 10920, for a host or a test that owns the sockets. The
+// session's stop closes them. Call it before StartStream.
+func (hud *CfmotoHUD) SetListeners(pxc, mediaControl, mediaStream stdnet.Listener) error {
+	hud.mu.Lock()
+	defer hud.mu.Unlock()
+	if hud.running {
+		return errors.New("already running")
+	}
+	hud.listeners = []stdnet.Listener{pxc, mediaControl, mediaStream}
 	return nil
 }
 
@@ -578,8 +593,19 @@ func (hud *CfmotoHUD) startStream(ctx context.Context, initConn stdnet.Conn, aft
 		hud.mu.Unlock()
 	}()
 
+	hud.mu.Lock()
+	listeners := hud.listeners
+	hud.listeners = nil // a server's Stop closes its listener: never served twice
+	hud.mu.Unlock()
+	listenOn := func(server interface{ SetListener(stdnet.Listener) }, i int) {
+		if listeners != nil {
+			server.SetListener(listeners[i])
+		}
+	}
+
 	pxcReady := make(chan any, 1)
 	pxcServer := net.NewPXCControl(":10922", hud.keyPair, hud.phoneConfig)
+	listenOn(pxcServer, 0)
 	pxcServer.SetProactiveHeartbeat(hud.proactivePxcHeartbeat)
 	pxcServer.SetIdleProbe(hud.idleProbe)
 	if hud.tlsCert != nil {
@@ -639,6 +665,7 @@ func (hud *CfmotoHUD) startStream(ctx context.Context, initConn stdnet.Conn, aft
 		}
 	}()
 	mediaControl := net.NewMediaControl(":10921")
+	listenOn(mediaControl, 1)
 	mediaControl.TLS = pxcServer.SessionTLS
 	mediaControl.SupportFunction = hud.supportFunction
 	mediaControl.JpegStills = hud.jpegStills
@@ -658,6 +685,7 @@ func (hud *CfmotoHUD) startStream(ctx context.Context, initConn stdnet.Conn, aft
 	}
 	// -- maybe we could change chunkStep to something smaller to reduce latency?
 	mediaStream := net.NewMediaStream(":10920", hud.muxSource, 0x1000, 3*time.Millisecond)
+	listenOn(mediaStream, 2)
 	mediaStream.SetPlainFramingAllowed(hud.plainVideoFraming)
 	hud.wireVideo(mediaControl, mediaStream)
 	pxcServer.HeardElsewhere = mediaStream.LastPoll

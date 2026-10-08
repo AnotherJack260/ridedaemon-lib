@@ -201,6 +201,9 @@ type MobileSession struct {
 
 	stopped chan struct{}
 
+	// usbDial, when set, connects the adb tunnel's streams instead of 127.0.0.1 (tests).
+	usbDial func(service string) (stdnet.Conn, error)
+
 	// features is the DashFeatures made for this session (NewDashFeatures); relayEvent feeds it,
 	// and a stop or a newer DashFeatures discards what it has not handled yet.
 	features atomic.Pointer[DashFeatures]
