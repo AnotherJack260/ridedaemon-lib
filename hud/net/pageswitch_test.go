@@ -334,6 +334,47 @@ func TestReleaseDash(t *testing.T) {
 	}
 }
 
+// A dash that leaves switchEc2Background unanswered still gets STOP_SERVICE: the first command's
+// second frees the sender, which would otherwise wait out the dash's own 9 s while STOP_SERVICE
+// expired in the queue. Neither short wait retires the channel.
+func TestReleaseDashSendsStopServiceWhenTheFirstGoesUnanswered(t *testing.T) {
+	for _, stopAnswered := range []bool{true, false} {
+		control := NewPXCControl(":0", nil, nil) // the dash's own timeout: the default 9 s
+		client, phone := openPhoneChannel(t, control)
+		_ = phone.SetDeadline(time.Now().Add(5 * time.Second))
+		start := time.Now()
+		done := make(chan error, 1)
+		go func() { done <- control.ReleaseDash() }()
+
+		if got := readPXCResponse(t, phone); got.Command != PxcSwitchEcToBackground {
+			t.Fatalf("first: 0x%x", got.Command)
+		}
+		if got := readPXCResponse(t, phone); got.Command != PxcStopService {
+			t.Fatalf("second: 0x%x", got.Command)
+		}
+		if elapsed := time.Since(start); elapsed > 3*releaseDashWait/2 {
+			t.Fatalf("STOP_SERVICE went out after %v, want about %v", elapsed, releaseDashWait)
+		}
+		if stopAnswered {
+			control.handleEvent(&PXCResponse{Command: PxcStopService + 1}, client)
+		}
+		select {
+		case err := <-done:
+			if stopAnswered && err != nil {
+				t.Fatalf("ReleaseDash() = %v", err)
+			}
+			if !stopAnswered && !errors.Is(err, ErrPhoneCommandTimeout) {
+				t.Fatalf("ReleaseDash() = %v, want ErrPhoneCommandTimeout", err)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatal("ReleaseDash() never returned")
+		}
+		if control.phoneChannel() == nil {
+			t.Fatal("ReleaseDash's own short wait retired the phone channel")
+		}
+	}
+}
+
 func TestReleaseDashWithoutPhoneChannelSaysSo(t *testing.T) {
 	control := NewPXCControl(":0", nil, nil)
 	if err := control.ReleaseDash(); !errors.Is(err, ErrNoPhoneChannel) {

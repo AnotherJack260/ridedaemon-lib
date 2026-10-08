@@ -322,8 +322,8 @@ const (
 // EcpPagePhoneScreen is ECP_APP_PAGE_PHONE_SCREEN.
 const EcpPagePhoneScreen = 101
 
-// releaseDashWait bounds each of ReleaseDash's two commands: PxcUtils.waitSendStopResponse
-// gives STOP_SERVICE's answer one second (utils/PxcUtils.java:80-114).
+// releaseDashWait is how long each of ReleaseDash's two commands waits for its answer:
+// PxcUtils.waitSendStopResponse gives STOP_SERVICE's one second (utils/PxcUtils.java:80-114).
 const releaseDashWait = time.Second
 
 func init() {
@@ -392,15 +392,36 @@ func (s *PXCControl) SwitchEcToFront() {
 // ReleaseDash hands the dash back its own UI the way the official app does when the rider
 // disconnects: switchEc2Background, then STOP_SERVICE, one after the other on the phone channel
 // (ec/v.java:1695-1704; HomeActivity.java:896-898). Each waits for the dash's answer at most a
-// second, as the official app waits for STOP_SERVICE's (utils/PxcUtils.java:80-114). It sends
-// both whatever the dash's flavor: the host asked. Returns STOP_SERVICE's outcome.
+// second, as the official app waits for STOP_SERVICE's (utils/PxcUtils.java:80-114), and that
+// second frees the sender: a dash that leaves switchEc2Background unanswered still gets
+// STOP_SERVICE. Neither is dropped for waiting its turn, so STOP_SERVICE is on the wire before
+// ReleaseDash returns; a command already in flight holds them up for at most the dash's own
+// timeout. It sends both whatever the dash's flavor: the host asked. Returns STOP_SERVICE's outcome.
 func (s *PXCControl) ReleaseDash() error {
-	if _, err := s.SendPhoneCommand(PxcSwitchEcToBackground, nil, releaseDashWait); err != nil {
+	if err := s.releaseCommand(PxcSwitchEcToBackground); err != nil {
 		if errors.Is(err, ErrNoPhoneChannel) || errors.Is(err, errSessionStopping) {
 			return err
 		}
 		logging.Printf("PXC release: %v; sending STOP_SERVICE anyway", err)
 	}
-	_, err := s.SendPhoneCommand(PxcStopService, nil, releaseDashWait)
-	return err
+	return s.releaseCommand(PxcStopService)
+}
+
+// releaseCommand queues one of ReleaseDash's commands and waits until it is written and answered,
+// or its releaseDashWait has run out.
+func (s *PXCControl) releaseCommand(cmd uint32) error {
+	req := &p2cRequest{cmd: cmd, wait: releaseDashWait}
+	err := s.enqueueP2C(req)
+	if err == nil {
+		select {
+		case r := <-req.done:
+			err = r.err
+		case <-s.quit:
+			err = errSessionStopping
+		}
+	}
+	if err != nil {
+		return fmt.Errorf("phone command 0x%x: %w", cmd, err)
+	}
+	return nil
 }

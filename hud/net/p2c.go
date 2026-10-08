@@ -79,7 +79,10 @@ type p2cRequest struct {
 	// onWritten, when set, runs on the sender as soon as the write has been attempted, so an
 	// internal caller can report what reached the wire without waiting for the ack.
 	onWritten func(conn net.Conn, err error)
-	done      chan p2cResult // buffered: the sender never blocks on a caller that left
+	// wait, when positive, replaces the dash's own timeout for this command's answer, and running
+	// out of it frees the sender without judging the dash or retiring the channel: ReleaseDash's.
+	wait time.Duration
+	done chan p2cResult // buffered: the sender never blocks on a caller that left
 }
 
 type p2cResult struct {
@@ -132,24 +135,26 @@ func (s *PXCControl) SendPhoneCommand(cmd uint32, body []byte, timeout time.Dura
 
 // queueP2C hands one command to the sender without waiting for it.
 func (s *PXCControl) queueP2C(cmd uint32, body []byte, deadline time.Time, onWritten func(net.Conn, error)) (*p2cRequest, error) {
+	req := &p2cRequest{cmd: cmd, body: body, deadline: deadline, onWritten: onWritten}
+	if err := s.enqueueP2C(req); err != nil {
+		return nil, err
+	}
+	return req, nil
+}
+
+func (s *PXCControl) enqueueP2C(req *p2cRequest) error {
 	if s.isStopping() {
-		return nil, errSessionStopping
+		return errSessionStopping
 	}
 	if s.phoneChannel() == nil {
-		return nil, ErrNoPhoneChannel
+		return ErrNoPhoneChannel
 	}
-	req := &p2cRequest{
-		cmd:       cmd,
-		body:      body,
-		deadline:  deadline,
-		onWritten: onWritten,
-		done:      make(chan p2cResult, 1),
-	}
+	req.done = make(chan p2cResult, 1)
 	select {
 	case s.p2cQueue <- req:
-		return req, nil
+		return nil
 	default:
-		return nil, ErrPhoneQueueFull
+		return ErrPhoneQueueFull
 	}
 }
 
@@ -183,7 +188,7 @@ func (s *PXCControl) runP2C() {
 				req.done <- p2cResult{err: errPhoneCommandExpired}
 				continue
 			}
-			reply, err := s.p2cExchange(req.cmd, req.body, req.onWritten)
+			reply, err := s.p2cExchange(req.cmd, req.body, req.wait, req.onWritten)
 			req.done <- p2cResult{reply: reply, err: err}
 		case <-idle.C:
 			// Only while there is a phone channel: once the dash has closed it, there is
@@ -195,11 +200,11 @@ func (s *PXCControl) runP2C() {
 			idleTicks++
 			if probe {
 				// x0 expects 0x80000010 and only logs anything else; a miss is not an error there.
-				if reply, err := s.p2cExchange(0, nil, nil); err == nil && reply.Command != PxcStatusUnsupported {
+				if reply, err := s.p2cExchange(0, nil, 0, nil); err == nil && reply.Command != PxcStatusUnsupported {
 					logging.Printf("PXC idle probe: cmd 0 answered 0x%x", reply.Command)
 				}
 			} else if s.proactiveHeartbeat {
-				if _, err := s.p2cExchange(PxcHeartbeat, nil, nil); err != nil && !s.isStopping() {
+				if _, err := s.p2cExchange(PxcHeartbeat, nil, 0, nil); err != nil && !s.isStopping() {
 					logging.Printf("PXC CAR_DATA heartbeat: %v", err)
 				}
 			}
@@ -254,8 +259,9 @@ func (s *PXCControl) p2cReplyTimeout() time.Duration {
 	return defaultP2CReplyTimeout
 }
 
-// p2cExchange writes one command on the newest phone channel and waits for its answer.
-func (s *PXCControl) p2cExchange(cmd uint32, body []byte, onWritten func(net.Conn, error)) (*PXCResponse, error) {
+// p2cExchange writes one command on the newest phone channel and waits for its answer: for the
+// dash's own timeout, or for wait when that is positive (see p2cRequest.wait).
+func (s *PXCControl) p2cExchange(cmd uint32, body []byte, wait time.Duration, onWritten func(net.Conn, error)) (*PXCResponse, error) {
 	conn := s.phoneChannel()
 	if conn == nil {
 		if onWritten != nil {
@@ -286,6 +292,9 @@ func (s *PXCControl) p2cExchange(cmd uint32, body []byte, onWritten func(net.Con
 	}
 
 	timeout := s.p2cReplyTimeout()
+	if wait > 0 {
+		timeout = wait
+	}
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	for {
@@ -295,6 +304,9 @@ func (s *PXCControl) p2cExchange(cmd uint32, body []byte, onWritten func(net.Con
 		case <-state.done:
 			return nil, errors.New("the phone channel closed before the dash answered")
 		case <-timer.C:
+			if wait > 0 {
+				return nil, fmt.Errorf("%w within %s", ErrPhoneCommandTimeout, timeout)
+			}
 			s.judgeSilentDash(state, cmd, timeout)
 			// The answer may still come, and with no transaction ids it would be taken for the
 			// next command's. CarbitRide ends the whole session here (see judgeSilentDash); this
