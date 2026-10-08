@@ -8,6 +8,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/charliecharlieO-o/ridedaemon-go/internal/logging"
 )
@@ -47,6 +48,9 @@ const (
 	// keeps one in flight until its OKAY (and the banner offers no delayed ack); more waiting than
 	// this means the socket has stopped taking them.
 	adbInbound = 16
+	// adbWriteTimeout bounds one write to a stream's local socket; one that takes nothing for that
+	// long has stopped, and its stream is closed - with whatever was queued behind it, a CLSE too.
+	adbWriteTimeout = 10 * time.Second
 )
 
 // ADBDevice serves the head unit's adb streams over one accessory link.
@@ -57,6 +61,8 @@ type ADBDevice struct {
 	Dial func(service string) (net.Conn, error)
 	// OnBanner receives the head unit's CNXN banner.
 	OnBanner func(banner string)
+	// writeTimeout overrides adbWriteTimeout in tests.
+	writeTimeout time.Duration
 
 	writeMu sync.Mutex
 	mu      sync.Mutex
@@ -185,6 +191,11 @@ func (d *ADBDevice) deliver(s *adbStream) {
 				d.closeStream(s, false)
 				return
 			}
+			timeout := adbWriteTimeout
+			if d.writeTimeout > 0 {
+				timeout = d.writeTimeout
+			}
+			_ = s.conn.SetWriteDeadline(time.Now().Add(timeout))
 			if _, err := s.conn.Write(payload); err != nil {
 				d.closeStream(s, true)
 				return

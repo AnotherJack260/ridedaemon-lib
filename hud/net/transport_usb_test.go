@@ -180,3 +180,33 @@ func TestAStalledADBStreamDoesNotStallTheLink(t *testing.T) {
 		t.Fatalf("the closed stream's socket: %v", err)
 	}
 }
+
+// A stream whose local socket takes nothing for the write timeout is closed, and so is not kept,
+// socket and worker, until the whole link ends; the host is told with a CLSE, even when it had
+// already queued its own behind the stalled write.
+func TestAStalledADBStreamIsClosed(t *testing.T) {
+	host, link := stdnet.Pipe()
+	defer host.Close()
+	_ = host.SetDeadline(time.Now().Add(3 * time.Second))
+	device := NewADBDevice(link)
+	device.writeTimeout = 50 * time.Millisecond
+	device.Dial = func(string) (stdnet.Conn, error) {
+		phoneEnd, serviceEnd := stdnet.Pipe() // the service end never reads
+		t.Cleanup(func() { _ = serviceEnd.Close() })
+		return phoneEnd, nil
+	}
+	go func() { _ = device.Serve() }()
+	writeADB(t, host, adbCNXN, 0x01000001, 4096, []byte("host::\x00"))
+	readADB(t, host)
+	writeADB(t, host, adbOPEN, 1, 0, []byte("tcp:10922\x00"))
+	local := readADB(t, host).arg0
+
+	writeADB(t, host, adbWRTE, 1, local, []byte("stuck"))
+	writeADB(t, host, adbCLSE, 1, local, nil)
+	if p := readADB(t, host); p.cmd != adbCLSE || p.arg0 != local || p.arg1 != 1 {
+		t.Fatalf("after the stalled write: 0x%x %d %d, want CLSE", p.cmd, p.arg0, p.arg1)
+	}
+	if device.stream(local) != nil {
+		t.Fatal("the stalled stream is still open")
+	}
+}
