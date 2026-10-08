@@ -164,8 +164,9 @@ func (s *PXCControl) startP2C() {
 // has been queued for a heartbeat interval, send a heartbeat and wait for its answer the same
 // way (sdk/x0.java:184-224). The heartbeat stays opt-in (SetProactiveHeartbeat), as it was.
 //
-// ponytail: x0 also sends cmd 0 every 7th idle tick and expects 0x80000010
-// (sdk/x0.java:210-217); left out, since no dash has been seen to need it.
+// ponytail: x0 sends cmd 0 instead of the heartbeat on the first idle tick after a command and
+// every 7th after that, expecting 0x80000010 and ignoring a miss (sdk/x0.java:185-217); left
+// out, since no dash has been seen to need it.
 func (s *PXCControl) runP2C() {
 	defer s.wg.Done()
 	idle := time.NewTimer(s.heartbeatEvery())
@@ -182,7 +183,9 @@ func (s *PXCControl) runP2C() {
 			reply, err := s.p2cExchange(req.cmd, req.body, req.onWritten)
 			req.done <- p2cResult{reply: reply, err: err}
 		case <-idle.C:
-			if s.proactiveHeartbeat {
+			// Only while there is a phone channel: once the dash has closed it, there is
+			// nothing to keep alive and nothing to log every 2 s.
+			if s.proactiveHeartbeat && s.phoneChannel() != nil {
 				if _, err := s.p2cExchange(PxcHeartbeat, nil, nil); err != nil && !s.isStopping() {
 					logging.Printf("PXC CAR_DATA heartbeat: %v", err)
 				}

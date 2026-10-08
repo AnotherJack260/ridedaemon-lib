@@ -500,3 +500,40 @@ func TestReplyTimeoutIsTheDashOwn(t *testing.T) {
 		}
 	}
 }
+
+type peerConn struct {
+	stdnet.Conn
+	addr   stdnet.Addr
+	closed bool
+}
+
+func (c *peerConn) RemoteAddr() stdnet.Addr { return c.addr }
+func (c *peerConn) Close() error            { c.closed = true; return nil }
+
+func peerAt(t *testing.T, hostPort string) *peerConn {
+	t.Helper()
+	addr, err := stdnet.ResolveTCPAddr("tcp", hostPort)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &peerConn{addr: addr}
+}
+
+// CarbitRide replaces its P2C sender only for a 0x20000 from the same address, and refuses one
+// from anywhere else while the old one is alive (sdk/z.java:117-137).
+func TestOnlyTheDashCanReplaceItsPhoneChannel(t *testing.T) {
+	control := NewPXCControl(":0", nil, nil)
+	dash := peerAt(t, "192.168.43.10:40001")
+	stranger := peerAt(t, "192.168.43.66:40002")
+	dashAgain := peerAt(t, "192.168.43.10:40003")
+
+	if !control.setPhoneChannel(dash) {
+		t.Fatal("the first phone channel was refused")
+	}
+	if control.setPhoneChannel(stranger) || control.phoneChannel() != dash || dash.closed {
+		t.Fatal("another host took over the dash's phone channel")
+	}
+	if !control.setPhoneChannel(dashAgain) || control.phoneChannel() != dashAgain || !dash.closed {
+		t.Fatal("the dash's own new phone channel did not replace the old one")
+	}
+}

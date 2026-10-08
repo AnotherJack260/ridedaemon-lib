@@ -214,3 +214,35 @@ func TestKeyframeAsksAreRateLimited(t *testing.T) {
 		t.Fatalf("asked %d times in a burst, want 1", asks)
 	}
 }
+
+// A suppressed ask is not the last one: while the IDR is still owed, the next push after the
+// second is up asks again, or the picture would hold until the GOP came round.
+func TestASuppressedKeyframeAskIsRepeatedWhileTheIDRIsOwed(t *testing.T) {
+	source := NewLiveStreamSource(30, 3*time.Second, 2)
+	var asked []int
+	source.OnKeyframeNeeded = func(dropped int) { asked = append(asked, dropped) }
+	source.PushFrame(annexBAU(idr))
+	source.PushFrame(annexBAU(pFrame))
+	source.PushFrame(annexBAU(pFrame)) // overflow: ask
+	source.PushFrame(annexBAU(idr))    // answered
+	source.PushFrame(annexBAU(pFrame))
+	source.PushFrame(annexBAU(pFrame)) // overflow again within the second: suppressed
+	if len(asked) != 1 {
+		t.Fatalf("asks = %v, want one so far", asked)
+	}
+	source.mu.Lock()
+	source.lastKeyframeAsk = time.Now().Add(-2 * time.Second)
+	source.mu.Unlock()
+	source.PushFrame(annexBAU(pFrame)) // still owed, a second later: ask again
+	if len(asked) != 2 || asked[1] != 4 {
+		t.Fatalf("asks = %v, want a second ask covering the 4 AUs dropped since", asked)
+	}
+	source.PushFrame(annexBAU(idr)) // answered: nothing owed any more
+	source.mu.Lock()
+	source.lastKeyframeAsk = time.Time{}
+	source.mu.Unlock()
+	source.PushFrame(annexBAU(pFrame))
+	if len(asked) != 2 {
+		t.Fatalf("asked again after the IDR arrived: %v", asked)
+	}
+}

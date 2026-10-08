@@ -251,9 +251,11 @@ type LiveStreamSource struct {
 	// OnKeyframeNeeded, when set before the first push, is told that the queue overflowed
 	// with nothing decodable left in it and is now dropping until the next IDR, with how many
 	// AUs went. The host answers by asking its encoder for a sync frame. Called from PushFrame,
-	// outside the lock, at most once a second.
+	// outside the lock, at most once a second, and again each second the IDR is still owed.
 	OnKeyframeNeeded func(dropped int)
 	lastKeyframeAsk  time.Time
+	keyframeOwed     bool // an overflow armed the IDR wait and no IDR has arrived since
+	owedDropped      int  // AUs dropped since the last ask
 }
 
 func NewLiveStreamSource(targetFPS int, liveTimeout time.Duration, maxQ int) *LiveStreamSource {
@@ -316,9 +318,14 @@ func (s *LiveStreamSource) pushLocked(au []byte) int {
 	s.lastInput = now
 	if s.awaitIDR && !s.opaque {
 		if !hasAnnexBNALType(au, 5) {
+			if s.keyframeOwed {
+				s.owedDropped++
+				return s.askForKeyframeLocked(now)
+			}
 			return 0
 		}
 		s.awaitIDR = false
+		s.keyframeOwed, s.owedDropped = false, 0
 	}
 
 	if s.count == s.capacity {
@@ -330,12 +337,10 @@ func (s *LiveStreamSource) pushLocked(au []byte) int {
 			// The official app never gets here - one frame in flight per poll
 			// (base/q0.java:585-596, 713-721) - so the queue waits for an IDR and asks for one.
 			s.awaitIDR = true
+			s.keyframeOwed = true
+			s.owedDropped += dropped + 1
 			logging.Printf("LiveStreamSource: queue overflowed with no IDR in it; dropped %d AUs, waiting for an IDR", dropped+1)
-			if now.Sub(s.lastKeyframeAsk) < time.Second {
-				return 0 // ponytail: one ask a second; the encoder's IDR is on its way
-			}
-			s.lastKeyframeAsk = now
-			return dropped + 1
+			return s.askForKeyframeLocked(now)
 		}
 	}
 
@@ -345,6 +350,20 @@ func (s *LiveStreamSource) pushLocked(au []byte) int {
 	s.tail = (s.tail + 1) % s.capacity
 	s.count++
 	return 0
+}
+
+// askForKeyframeLocked returns how many AUs to report with an ask, or 0 when the last ask was
+// under a second ago. ponytail: one ask a second - a dash that stops polling overflows the
+// queue every few frames, and an IDR every 200 ms would be most of the bitrate - but asked
+// again each second the IDR is still owed, so a suppressed ask is never the last one.
+func (s *LiveStreamSource) askForKeyframeLocked(now time.Time) int {
+	if now.Sub(s.lastKeyframeAsk) < time.Second {
+		return 0
+	}
+	s.lastKeyframeAsk = now
+	n := s.owedDropped
+	s.owedDropped = 0
+	return n
 }
 
 // dropToIDRLocked drops the oldest AU and every predicted AU behind it up to the next queued

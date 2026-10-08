@@ -318,6 +318,8 @@ type PXCControl struct {
 	// own 0x20031 ack arrives separately, through the unhandled-response branch.
 	OnAppStatus func(mode int, err error)
 
+	clientInfoMu sync.Mutex
+
 	// The phone channel and its one sender; see p2c.go and phoneChannel.
 	phoneMu    sync.Mutex
 	phone      net.Conn
@@ -802,49 +804,17 @@ func (s *PXCControl) handleEvent(event *PXCResponse, conn net.Conn) {
 			s.emitError(s.connectionError(conn, PxcWriteErr, err))
 			return
 		}
-		s.setPhoneChannel(conn)
+		if !s.setPhoneChannel(conn) {
+			s.connectionState(conn).superseded.Store(true)
+			_ = conn.Close()
+			return
+		}
 		s.startP2C()
 		// The official app's first APPSTATUS goes out as soon as this channel is up
 		// (b0.r -> ec/v -> t0.q0), before any capture is negotiated.
 		s.SendAppStatus(AppStatusBackground)
 	case PxcHudConf:
-		s.emitEvent(*event)
-		if s.HudConfig == nil {
-			// Read HudConfig and store it, leniently (see decodeLenient): a field of a type
-			// this struct did not expect used to end the session right after the handshake.
-			var conf HUDConfig
-			if err := decodeLenient(event.Body, &conf); err != nil {
-				s.emitError(&PxcError{PxcHudCfgErr, err, true})
-				break
-			}
-			s.HudConfig = &conf
-			s.noteSocketTimeout(conf.SocketTimeoutPeriodWifi)
-			// Set encrypted huid to phone config
-			if err := s.buildPC(); err != nil {
-				s.emitError(&PxcError{PxcHudCfgErr, err, true})
-				break
-			}
-		} else {
-			// The dash sends CLIENT_INFO again when it reopens 0x10000 after a Wi-Fi blip, and
-			// waits on its connect page for the reply. The official app answers every one
-			// (sdk/b0.java:435-448, ECP_C2P_CLIENT_INFO.java:1058); this ignored all but the
-			// first. ponytail: the first one's config is kept - same dash, same HUID; re-parse
-			// if a dash is ever seen changing it mid-session.
-			logging.Printf("PXC CLIENT_INFO again; answering it with this session's reply")
-		}
-		// Respond with phone conf
-		if b, err := json.Marshal(s.PhoneConfig); err != nil {
-			s.emitError(&PxcError{PxcHudCfgErr, err, true})
-			break
-		} else {
-			response := &PXCResponse{Command: PxcPhoneConf, Body: b}
-			if err = s.writeResponse(response, conn, nil); err != nil {
-				s.emitError(s.connectionError(conn, PxcWriteErr, err))
-				break
-			}
-			s.emitEvent(*response)
-			s.maybeScheduleProactiveQueryTime(conn)
-		}
+		s.answerClientInfo(event, conn)
 	case PxcSpeedConf:
 		s.emitEvent(*event)
 		response := &PXCResponse{Command: PxcSpeedOk}
@@ -977,6 +947,52 @@ func (s *PXCControl) handleEvent(event *PXCResponse, conn net.Conn) {
 			s.emitEvent(*event)
 		}
 	}
+}
+
+// answerClientInfo handles CLIENT_INFO. The reply is built one CLIENT_INFO at a time - a dash
+// opening two request channels at once must not have one reply marshalled while the other is
+// still filling PhoneConfig - and written outside the lock.
+func (s *PXCControl) answerClientInfo(event *PXCResponse, conn net.Conn) {
+	s.emitEvent(*event)
+	reply, err := s.clientInfoReply(event.Body)
+	if err != nil {
+		s.emitError(&PxcError{PxcHudCfgErr, err, true})
+		return
+	}
+	response := &PXCResponse{Command: PxcPhoneConf, Body: reply}
+	if err = s.writeResponse(response, conn, nil); err != nil {
+		s.emitError(s.connectionError(conn, PxcWriteErr, err))
+		return
+	}
+	s.emitEvent(*response)
+	s.maybeScheduleProactiveQueryTime(conn)
+}
+
+func (s *PXCControl) clientInfoReply(body []byte) ([]byte, error) {
+	s.clientInfoMu.Lock()
+	defer s.clientInfoMu.Unlock()
+	if s.HudConfig == nil {
+		// Read HudConfig and store it, leniently (see decodeLenient): a field of a type
+		// this struct did not expect used to end the session right after the handshake.
+		var conf HUDConfig
+		if err := decodeLenient(body, &conf); err != nil {
+			return nil, err
+		}
+		s.HudConfig = &conf
+		s.noteSocketTimeout(conf.SocketTimeoutPeriodWifi)
+		// Set encrypted huid to phone config
+		if err := s.buildPC(); err != nil {
+			return nil, err
+		}
+	} else {
+		// The dash sends CLIENT_INFO again when it reopens 0x10000 after a Wi-Fi blip, and
+		// waits on its connect page for the reply. The official app answers every one
+		// (sdk/b0.java:435-448, ECP_C2P_CLIENT_INFO.java:1058); this ignored all but the
+		// first. ponytail: the first one's config is kept - same dash, same HUID; re-parse
+		// if a dash is ever seen changing it mid-session.
+		logging.Printf("PXC CLIENT_INFO again; answering it with this session's reply")
+	}
+	return json.Marshal(s.PhoneConfig)
 }
 
 func (s *PXCControl) Start() error {

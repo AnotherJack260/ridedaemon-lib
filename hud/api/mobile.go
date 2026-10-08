@@ -97,8 +97,11 @@ type MobileConfig struct {
 	// dashboards use it as a capability bitmask, so the Android host must be
 	// able to select it from its resolved T-Box profile.
 	SupportFunction int
-	// ProactivePxcHeartbeatEnabled keeps both reverse PXC sockets alive on
-	// firmware profiles known to tear down silent channels.
+	// ProactivePxcHeartbeatEnabled keeps the reverse PXC sockets alive on
+	// firmware profiles known to tear down silent channels: the phone channel
+	// (0x20000) always, with each beat's answer awaited so a dead dash ends the
+	// session after its own timeout, and the request channel only until the dash
+	// shows a keepalive of its own there.
 	ProactivePxcHeartbeatEnabled bool
 	// PlainVideoFramingAllowed lets a dash reporting supportExtendProtocol=0 pull
 	// video frames without the 4-byte index. Set it only for dashboards the host

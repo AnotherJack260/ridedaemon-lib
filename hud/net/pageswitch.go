@@ -104,21 +104,40 @@ func (s *PXCControl) phoneChannel() net.Conn {
 }
 
 // setPhoneChannel makes conn the phone channel. A new 0x20000 replaces the old sender and
-// closes its socket in CarbitRide (sdk/z.java:117-137, a()), so the one it replaces is closed
-// here too, quietly: whatever is waiting on it gives up now instead of at its timeout.
-func (s *PXCControl) setPhoneChannel(conn net.Conn) {
+// closes its socket in CarbitRide - but only from the same client address; from another one
+// the new socket is refused while the old sender is alive (sdk/z.java:117-137). Both are done
+// here, the replaced one closed quietly so whatever waits on it gives up now instead of at its
+// timeout. Reports whether conn was taken.
+func (s *PXCControl) setPhoneChannel(conn net.Conn) bool {
 	s.phoneMu.Lock()
 	old := s.phone
+	if old != nil && old != conn && peerHost(old) != peerHost(conn) {
+		s.phoneMu.Unlock()
+		logging.Printf("PXC: refusing a phone channel from %v, the dash's is from %v", conn.RemoteAddr(), old.RemoteAddr())
+		return false
+	}
 	s.phone = conn
 	s.phoneMu.Unlock()
 	if old == nil || old == conn {
-		return
+		return true
 	}
 	if value, ok := s.connections.Load(old); ok {
 		value.(*pxcConnectionState).superseded.Store(true)
 	}
 	logging.Printf("PXC: the dash opened a new phone channel, closing the old one")
 	_ = old.Close()
+	return true
+}
+
+func peerHost(conn net.Conn) string {
+	addr := conn.RemoteAddr()
+	if addr == nil {
+		return ""
+	}
+	if host, _, err := net.SplitHostPort(addr.String()); err == nil {
+		return host
+	}
+	return addr.String()
 }
 
 func (s *PXCControl) isPhoneConn(conn net.Conn) bool {
