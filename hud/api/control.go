@@ -1,5 +1,7 @@
 package api
 
+import "github.com/charliecharlieO-o/ridedaemon-go/hud/core"
+
 // Control-plane API: what the host can tell the dash, or about itself, beyond the video. The
 // transport events these produce are listed in hud/core (TransportCmd*) and hud/net (Pxc*).
 
@@ -26,4 +28,55 @@ func (ms *MobileSession) SetAppForeground(foreground bool) {
 // default; false restores the earlier wire. Call it before StartSession.
 func (ms *MobileSession) SetFlavor51Lifecycle(enabled bool) {
 	ms.hud.SetFlavor51Lifecycle(enabled)
+}
+
+// PhoneIdentity is who the phone says it is to the dash, in the CLIENT_INFO reply. The app keeps
+// these values across sessions and passes the same ones every time - the official app does, so a
+// dash that remembers phones recognises this one - and the library never writes anything. Any
+// field left at its zero value keeps the default every earlier build sent.
+type PhoneIdentity struct {
+	// Package is the package the reply names, e.g. "net.easyconn.easyride.wws" for a flavor-51
+	// dash. Default "com.cfmoto.cfmotointernational".
+	Package string
+	// PhoneUUID is a stable id for this phone; generate it once and keep it. Default: a new UUID
+	// for every MobileSession.
+	PhoneUUID string
+	// RSAKey is the phone's RSA private key, PEM or DER, PKCS#8 (PrivateKey.getEncoded()) or
+	// PKCS#1; 1024 bits like the official app's. Generate it once and keep it. Default: a new
+	// key every session.
+	RSAKey []byte
+	// Brand, Model, SdkVersion and BluetoothName are Build.BRAND, Build.MODEL,
+	// Build.VERSION.SDK_INT and the Bluetooth adapter name. Defaults "google", "Pixel 6a", 36,
+	// "Pixel 6a".
+	Brand         string
+	Model         string
+	SdkVersion    int
+	BluetoothName string
+	// EchoSupportFunction answers with the dash's own supportFunction - or its supportFunctionEx
+	// & 0xFFBFFFDF - as the official app does, instead of MobileConfig.SupportFunction. It claims
+	// every capability the dash offers, so turn it on only for a profile that can back them.
+	EchoSupportFunction bool
+	// SpeechEngineType adds "speechEngineType" to the reply: 0 leaves it out (default), -1 sends
+	// what the official app sends (the dash's supportSpeechEngine, 2 when absent), any positive
+	// value is sent as given.
+	SpeechEngineType int
+}
+
+// SetPhoneIdentity applies id to the CLIENT_INFO reply. Call it before StartSession; it errors
+// on a session already running or a key it cannot read.
+func (ms *MobileSession) SetPhoneIdentity(id *PhoneIdentity) error {
+	if id == nil {
+		return nil
+	}
+	return ms.hud.SetPhoneIdentity(core.PhoneIdentity{
+		Package:             id.Package,
+		PhoneUUID:           id.PhoneUUID,
+		RSAKey:              append([]byte(nil), id.RSAKey...),
+		Brand:               id.Brand,
+		Model:               id.Model,
+		SdkVersion:          id.SdkVersion,
+		BluetoothName:       id.BluetoothName,
+		EchoSupportFunction: id.EchoSupportFunction,
+		SpeechEngineType:    id.SpeechEngineType,
+	})
 }

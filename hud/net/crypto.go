@@ -5,9 +5,11 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/base64"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"math/big"
+	"strings"
 )
 
 type KeyPair struct {
@@ -21,6 +23,47 @@ func GenKeyPair() (*KeyPair, error) {
 	} else {
 		return &KeyPair{*p}, nil
 	}
+}
+
+// ParseKeyPair reads the phone's persistent RSA identity key, which the official app keeps from
+// one session to the next (RSAUtil.getPublicKey, nec/utils/RSAUtil.java:114-138) so a dash sees
+// the same phone every time. PEM or DER, PKCS#8 (what java.security.PrivateKey.getEncoded()
+// returns) or PKCS#1. The official app's is 1024 bits; any RSA size is accepted.
+func ParseKeyPair(b []byte) (*KeyPair, error) {
+	key, err := parsePrivateKey(b)
+	if err != nil {
+		return nil, err
+	}
+	rsaKey, ok := key.(*rsa.PrivateKey)
+	if !ok {
+		return nil, fmt.Errorf("the phone identity key must be RSA, not %T", key)
+	}
+	return &KeyPair{*rsaKey}, nil
+}
+
+// parsePrivateKey reads a private key the way an Android app holds one: the first PEM block whose
+// type names a private key, or DER; PKCS#8, PKCS#1 or SEC1.
+func parsePrivateKey(b []byte) (any, error) {
+	for rest := b; ; {
+		var block *pem.Block
+		if block, rest = pem.Decode(rest); block == nil {
+			break
+		}
+		if strings.HasSuffix(block.Type, "PRIVATE KEY") {
+			b = block.Bytes
+			break
+		}
+	}
+	if key, err := x509.ParsePKCS8PrivateKey(b); err == nil {
+		return key, nil
+	}
+	if key, err := x509.ParsePKCS1PrivateKey(b); err == nil {
+		return key, nil
+	}
+	if key, err := x509.ParseECPrivateKey(b); err == nil {
+		return key, nil
+	}
+	return nil, errors.New("not a PKCS#8, PKCS#1 or SEC1 private key, in PEM or DER")
 }
 
 func (kp *KeyPair) GetPrivateEncoded() (string, error) {

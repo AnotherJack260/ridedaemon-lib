@@ -131,22 +131,25 @@ type HUDConfig struct {
 	// identifies its development profile with a string ("simulator"). The
 	// transport forwards the original HUD_CONFIG to Android and does not need a
 	// normalized value here, so retain the JSON form and accept both variants.
-	Flavor                    json.RawMessage `json:"flavor"`
-	MirrorMode                int             `json:"mirrorMode"`
-	PackageName               string          `json:"package_name"`
-	ProductType               int             `json:"productType"`
-	PxcVersion                string          `json:"pxcVersion"`
-	ScreenType                int             `json:"screenType"`
-	SdkVersion                string          `json:"sdkVersion"`
-	SocketTimeoutPeriodWifi   int             `json:"socketTimeoutPeriodWifi"`
-	SteeringMode              int             `json:"steeringMode"`
-	SupportBTCall             bool            `json:"supportBTCall"`
-	SupportBTSetting          bool            `json:"supportBTSetting"`
-	SupportBackDesktop        bool            `json:"supportBackDesktop"`
-	SupportBackDesktopNew     bool            `json:"supportBackDesktopNew"`
-	SupportConnect            int             `json:"supportConnect"`
-	SupportDownloadScreenEvt  bool            `json:"supportDownloadScreenEvt"`
-	SupportFunction           int             `json:"supportFunction"`
+	Flavor                   json.RawMessage `json:"flavor"`
+	MirrorMode               int             `json:"mirrorMode"`
+	PackageName              string          `json:"package_name"`
+	ProductType              int             `json:"productType"`
+	PxcVersion               string          `json:"pxcVersion"`
+	ScreenType               int             `json:"screenType"`
+	SdkVersion               string          `json:"sdkVersion"`
+	SocketTimeoutPeriodWifi  int             `json:"socketTimeoutPeriodWifi"`
+	SteeringMode             int             `json:"steeringMode"`
+	SupportBTCall            bool            `json:"supportBTCall"`
+	SupportBTSetting         bool            `json:"supportBTSetting"`
+	SupportBackDesktop       bool            `json:"supportBackDesktop"`
+	SupportBackDesktopNew    bool            `json:"supportBackDesktopNew"`
+	SupportConnect           int             `json:"supportConnect"`
+	SupportDownloadScreenEvt bool            `json:"supportDownloadScreenEvt"`
+	SupportFunction          int             `json:"supportFunction"`
+	// Kept raw: the official app tells "sent" from "absent" for these two (CI:887-890, 922-926).
+	SupportFunctionEx         json.RawMessage `json:"supportFunctionEx"`
+	SupportSpeechEngine       json.RawMessage `json:"supportSpeechEngine"`
 	SupportHID                bool            `json:"supportHID"`
 	SupportLandscapeAdaptive  bool            `json:"supportLandscapeAdaptive"`
 	SupportMic                bool            `json:"supportMic"`
@@ -267,7 +270,11 @@ type PhoneConfig struct {
 	// value it does compute went only into the RLY for MEDIA_CONTROL 0x60 - which
 	// firmware that runs supportExtendProtocol=0 never asks for, so on those units the
 	// number was never stated at all.
-	SupportFunction int `json:"supportFunction"`
+	//
+	// A pointer so the reply can leave it out: the official app omits it when it echoes
+	// supportFunctionEx instead (CI:1030-1036). The host's profile value otherwise.
+	SupportFunction   *int64 `json:"supportFunction,omitempty"`
+	SupportFunctionEx *int64 `json:"supportFunctionEx,omitempty"`
 	// There is deliberately no supportSyncCorrectTime here. It was added on
 	// 2026-08-10 on the theory that a Carbit dash only asks a phone that claims
 	// the capability, and removed the same day: the reference implementation
@@ -281,6 +288,40 @@ type PhoneConfig struct {
 	// the work is what caused harm. Do not re-add this without a rider log
 	// showing a dash that stays silent until it is claimed.
 	AppVersionFingerPrint string `json:"appVersionFingerPrint"`
+	// speechEngineType is the extra the official app adds to this reply (ec/b.java:564-567); sent
+	// only when the host asks for it (SetSpeechEngineType).
+	SpeechEngineType *int `json:"speechEngineType,omitempty"`
+}
+
+// supportFunctionExMask is CI.r(): the bits the official app never echoes back in
+// supportFunctionEx (ECP_C2P_CLIENT_INFO.java:486-488, 1035).
+const supportFunctionExMask = 0xFFBFFFDF
+
+// echoSupportFunction answers the dash's capabilities with its own, as the official app does
+// (CI:877-890, 1030-1036): supportFunctionEx & 0xFFBFFFDF and no supportFunction when the dash
+// sent an Ex; its supportFunction otherwise, 0 when it sent none (b0.O() for this build).
+func echoSupportFunction(conf *HUDConfig, pc *PhoneConfig) {
+	if ex, ok := optLong(conf.SupportFunctionEx); ok {
+		masked := ex & supportFunctionExMask
+		pc.SupportFunction, pc.SupportFunctionEx = nil, &masked
+		return
+	}
+	sf := int64(conf.SupportFunction)
+	pc.SupportFunction, pc.SupportFunctionEx = &sf, nil
+}
+
+// carbitSpeechEngineType is the value the official app puts in speechEngineType: the dash's
+// supportSpeechEngine, 2 when absent, and 2002 read as 2001 except on channel 16206 (XF06)
+// (CI:922-932, ec/b.java:566).
+func carbitSpeechEngineType(conf *HUDConfig) int {
+	engine, ok := optLong(conf.SupportSpeechEngine)
+	if !ok {
+		engine = 2
+	}
+	if engine == 2002 && conf.Channel != "16206" {
+		engine = 2001
+	}
+	return int(engine)
 }
 
 type PXCControl struct {
@@ -334,6 +375,11 @@ type PXCControl struct {
 	OnAppStatus func(mode int, err error)
 
 	clientInfoMu sync.Mutex
+
+	// What the CLIENT_INFO reply echoes of the dash's own; see SetEchoSupportFunction and
+	// SetSpeechEngineType.
+	echoSupportFunction bool
+	speechEngineType    int
 
 	// noFlavor51Lifecycle turns off what a flavor-51 dash gets by default; see carbitLifecycle.
 	noFlavor51Lifecycle bool
@@ -518,6 +564,21 @@ func (s *PXCControl) SetSkipDashClockSync(skip bool) {
 // Configure it before Start.
 func (s *PXCControl) SetDashAsksForTime(asks bool) {
 	s.dashAsksForTime = asks
+}
+
+// SetEchoSupportFunction answers CLIENT_INFO with the dash's own supportFunction[Ex] the way the
+// official app does (echoSupportFunction), instead of the host's profile value. Off by default:
+// it claims every capability the dash offers, which the official app can back and a host may
+// not. Configure it before Start.
+func (s *PXCControl) SetEchoSupportFunction(echo bool) {
+	s.echoSupportFunction = echo
+}
+
+// SetSpeechEngineType adds speechEngineType to the CLIENT_INFO reply: 0 leaves it out (as every
+// earlier build did), a negative value sends what the official app sends
+// (carbitSpeechEngineType), a positive one is sent as given. Configure it before Start.
+func (s *PXCControl) SetSpeechEngineType(engine int) {
+	s.speechEngineType = engine
 }
 
 // queryTimeAckBody and huTimeSyncAckBody exist so the two clock answers cannot
@@ -1116,6 +1177,16 @@ func (s *PXCControl) clientInfoReply(body []byte) ([]byte, error) {
 		// Set encrypted huid to phone config
 		if err := s.buildPC(); err != nil {
 			return nil, err
+		}
+		if s.echoSupportFunction {
+			echoSupportFunction(&conf, s.PhoneConfig)
+		}
+		s.PhoneConfig.SpeechEngineType = nil
+		if engine := s.speechEngineType; engine != 0 {
+			if engine < 0 {
+				engine = carbitSpeechEngineType(&conf)
+			}
+			s.PhoneConfig.SpeechEngineType = &engine
 		}
 	} else {
 		// The dash sends CLIENT_INFO again when it reopens 0x10000 after a Wi-Fi blip, and

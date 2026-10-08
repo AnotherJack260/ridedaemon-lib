@@ -113,6 +113,11 @@ type CfmotoHUD struct {
 	skipDashClockSync     bool
 	dashAsksForTime       bool
 
+	// What the host said about the phone; see SetPhoneIdentity.
+	identityKey         *net.KeyPair
+	echoSupportFunction bool
+	speechEngineType    int
+
 	// net management
 	keyPair      *net.KeyPair
 	ecService    *net.ECService
@@ -136,6 +141,7 @@ func NewCfmotoHUD(targetFPS int, mux *stream.MuxSource, supportFunction int) *Cf
 	}
 	id := uuid.New()
 	pkg := "com.cfmoto.cfmotointernational"
+	sf := int64(supportFunction)
 	return &CfmotoHUD{
 		packageName:     pkg,
 		phoneUUID:       id,
@@ -154,7 +160,7 @@ func NewCfmotoHUD(targetFPS int, mux *stream.MuxSource, supportFunction int) *Cf
 			EncryptedHUID:         "", // Done inside PXC
 			BluetoothName:         "Pixel 6a",
 			SupportH264IFrame:     true,
-			SupportFunction:       supportFunction,
+			SupportFunction:       &sf,
 			AppVersionFingerPrint: "V:2.2.1(121)--ONLINE",
 		},
 		targetFPS: targetFPS,
@@ -163,6 +169,67 @@ func NewCfmotoHUD(targetFPS int, mux *stream.MuxSource, supportFunction int) *Cf
 		Events:    make(chan HudEvent, 32),
 		Errors:    make(chan error, 32),
 	}
+}
+
+// PhoneIdentity is who the phone says it is in the CLIENT_INFO reply. The host keeps these from
+// one session to the next - the official app does (phoneUUID and its RSA key, dk/a.java:114-130,
+// nec/utils/RSAUtil.java:114-138), so a dash that remembers phones sees the same one each time -
+// and this library never stores anything. A zero field keeps what every earlier build sent.
+type PhoneIdentity struct {
+	// Package goes out as "package": the official app sends its own (CI:1019).
+	Package string
+	// PhoneUUID goes out as "phoneUUID"; the default is new for every MobileSession.
+	PhoneUUID string
+	// RSAKey signs encryptedHUID and gives "pubkey" (net.ParseKeyPair); the default is a fresh
+	// 1024-bit key per session.
+	RSAKey []byte
+	// Brand, Model, SdkVersion and BluetoothName are Build.BRAND, Build.MODEL,
+	// Build.VERSION.SDK_INT and the Bluetooth adapter's name (CI:1015-1018, 1025).
+	Brand         string
+	Model         string
+	SdkVersion    int
+	BluetoothName string
+	// EchoSupportFunction answers with the dash's own capability bits; see
+	// net.PXCControl.SetEchoSupportFunction.
+	EchoSupportFunction bool
+	// SpeechEngineType: see net.PXCControl.SetSpeechEngineType.
+	SpeechEngineType int
+}
+
+// SetPhoneIdentity applies id to the CLIENT_INFO reply. Call it before StartStream.
+func (hud *CfmotoHUD) SetPhoneIdentity(id PhoneIdentity) error {
+	var key *net.KeyPair
+	if len(id.RSAKey) > 0 {
+		var err error
+		if key, err = net.ParseKeyPair(id.RSAKey); err != nil {
+			return err
+		}
+	}
+	hud.mu.Lock()
+	defer hud.mu.Unlock()
+	if hud.running {
+		return errors.New("already running")
+	}
+	pc := hud.phoneConfig
+	set := func(field *string, value string) {
+		if value != "" {
+			*field = value
+		}
+	}
+	set(&pc.Package, id.Package)
+	set(&pc.PhoneUUID, id.PhoneUUID)
+	set(&pc.PhoneBrand, id.Brand)
+	set(&pc.PhoneModel, id.Model)
+	set(&pc.BluetoothName, id.BluetoothName)
+	if id.SdkVersion > 0 {
+		pc.PhoneOsVersion = strconv.Itoa(id.SdkVersion)
+	}
+	if key != nil {
+		hud.identityKey = key
+	}
+	hud.echoSupportFunction = id.EchoSupportFunction
+	hud.speechEngineType = id.SpeechEngineType
+	return nil
 }
 
 // SetProactivePxcHeartbeat enables the dual CAR_CTRL/CAR_DATA keepalive used by
@@ -453,9 +520,14 @@ func (hud *CfmotoHUD) startStream(ctx context.Context, initConn stdnet.Conn) (er
 	}
 	hud.mu.Unlock()
 
-	if hud.keyPair, err = net.GenKeyPair(); err != nil {
-		return err
+	if hud.keyPair = hud.identityKey; hud.keyPair == nil {
+		if hud.keyPair, err = net.GenKeyPair(); err != nil {
+			return err
+		}
 	}
+	// A previous session's echo may have rewritten these.
+	sf := int64(hud.supportFunction)
+	hud.phoneConfig.SupportFunction, hud.phoneConfig.SupportFunctionEx = &sf, nil
 
 	var started []StoppableServer
 
@@ -483,6 +555,8 @@ func (hud *CfmotoHUD) startStream(ctx context.Context, initConn stdnet.Conn) (er
 	pxcReady := make(chan any, 1)
 	pxcServer := net.NewPXCControl(":10922", hud.keyPair, hud.phoneConfig)
 	pxcServer.SetProactiveHeartbeat(hud.proactivePxcHeartbeat)
+	pxcServer.SetEchoSupportFunction(hud.echoSupportFunction)
+	pxcServer.SetSpeechEngineType(hud.speechEngineType)
 	pxcServer.SetPageSwitchProbe(hud.pageSwitchProbe)
 	pxcServer.OnPageSwitchProbe = func(step net.PageSwitchProbeStep, command uint32, err error) {
 		payload := make([]byte, 6)
