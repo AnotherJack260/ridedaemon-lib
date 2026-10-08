@@ -666,6 +666,23 @@ func TestRegisteredC2PHandlersAnswerTheirCommand(t *testing.T) {
 	assertNoPXCError(t, control)
 }
 
+// A handler for a command the switch answers itself, or for a reply, would never run: registering
+// one is refused like a duplicate.
+func TestRegisteringACommandTheSwitchAnswersPanics(t *testing.T) {
+	for _, cmd := range []uint32{PxcHandshake, PxcChannelCarData, PxcHudConf, PxcStartTLS, PxcSpeedConf,
+		PxcClientSet, PxcHeartbeat, PxcStatusUnsupported, PxcStatusError, PxcHuTimeSync, PxcQueryTime,
+		PxcCheckSnDone, 0x1FFD1} {
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Errorf("a handler for 0x%x was accepted", cmd)
+				}
+			}()
+			RegisterC2PHandler(cmd, func(*PXCControl, *PXCResponse) ([]byte, error) { return nil, nil })
+		}()
+	}
+}
+
 func TestRegisteringACommandTwicePanics(t *testing.T) {
 	defer func() {
 		if recover() == nil {

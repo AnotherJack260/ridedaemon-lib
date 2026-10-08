@@ -22,12 +22,21 @@
 //	5        core.TransportCmdKeyframeNeeded           u32 BE access units dropped
 //	16       TransportCmdCaptureConfig                 CaptureConfig as JSON
 //	0x100    core.TransportCmdUSBBanner                the head unit's adb banner text
-//	0x10380  net.PxcDashMainPage: show the home page   empty
+//	0x10380  net.PxcDashMainPage: show the home page   empty (act on OnGoHome, see below)
 //	0x103F0  net.PxcSwitchToAppPage: open a page       u32 BE type, u32 BE channel
 //	0x10490  net.PxcDashUiFront: dash UI in front      empty
 //	0x106F0  net.PxcDashDisconnect: dash disconnects   empty
 //	0x107C0  net.PxcStartTLS: dash asked for TLS       [1] switched, [0] no certificate set
 //
-// DashFeatures (NewDashFeatures) is fed the PXC events by the session itself; MCU-Lite reports
+// DashFeatures (NewDashFeatures) is fed the feature commands by the session itself; MCU-Lite reports
 // through MCULiteCallback, not OnEvent.
+//
+// # One request, one action
+//
+// The dash asking for the phone's home screen (0x10380) reaches the app three ways: the PXC event
+// (source 2, 0x10380, the dash's frame), the transport event 0x10380, and
+// DashFeatureListener.OnGoHome. Act on OnGoHome only; the two events report the same request for
+// field logs and must not trigger the home screen again. An app that makes no DashFeatures acts on
+// the transport event instead. For the other dash requests in the table, act on the transport
+// event; their PXC event is the same request, for logs.
 package api

@@ -444,10 +444,22 @@ var (
 	c2pHandlers   = map[uint32]C2PHandler{}
 )
 
+// switchCommands are the requests handleEvent's switch answers itself, ahead of the registry.
+// Keep it in step with that switch.
+var switchCommands = map[uint32]bool{
+	PxcHandshake: true, PxcChannelCarData: true, PxcHudConf: true, PxcStartTLS: true,
+	PxcSpeedConf: true, PxcClientSet: true, PxcHeartbeat: true, PxcStatusUnsupported: true,
+	PxcStatusError: true, PxcHuTimeSync: true, PxcQueryTime: true,
+}
+
 // RegisterC2PHandler makes h the answer to dash command cmd. Call it from an init() in the file
-// that owns the command. A command the dispatch switch names itself cannot be taken over, and a
-// command registered twice is a programming error.
+// that owns the command. A command the dispatch switch answers itself (switchCommands) or an odd
+// one - a reply, which nothing answers - would never reach h, so registering one panics, as
+// registering a command twice does: both are programming errors.
 func RegisterC2PHandler(cmd uint32, h C2PHandler) {
+	if switchCommands[cmd] || cmd&1 != 0 {
+		panic(fmt.Sprintf("C2P handler for 0x%x would never run: handleEvent answers it itself or it is a reply", cmd))
+	}
 	c2pHandlersMu.Lock()
 	defer c2pHandlersMu.Unlock()
 	if _, dup := c2pHandlers[cmd]; dup {
@@ -1068,7 +1080,7 @@ func (s *PXCControl) handleEvent(event *PXCResponse, conn net.Conn) {
 	if pxcIsReply(event.Command) && s.isPhoneConn(conn) {
 		s.deliverP2CReply(conn, event)
 	}
-	switch event.Command {
+	switch event.Command { // every even case is in switchCommands
 	case PxcHandshake:
 		// Named before it is answered, not after: a write that fails here produces an error whose
 		// whole value is saying WHICH channel could not be answered.
