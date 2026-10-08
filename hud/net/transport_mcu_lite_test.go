@@ -377,7 +377,9 @@ func TestMCUAndVMAreAnsweredLikeCarbit(t *testing.T) {
 		if got.Command != tc.want || string(got.Body) != tc.wantBody {
 			t.Fatalf("0x%x %q answered 0x%x %q, want 0x%x %q", tc.cmd, tc.body, got.Command, got.Body, tc.want, tc.wantBody)
 		}
-		if handled := control.serveOtherFamily(&PXCResponse{Command: tc.cmd, Body: []byte(tc.body)}, &countingConn{}); handled == tc.byDefault {
+		opened := &countingConn{} // a connection the dash opened with this very command
+		control.connectionState(opened).opening.Store(tc.cmd)
+		if handled := control.serveOtherFamily(&PXCResponse{Command: tc.cmd, Body: []byte(tc.body)}, opened); handled == tc.byDefault {
 			t.Fatalf("0x%x: family hook handled = %v", tc.cmd, handled)
 		}
 		_ = dash.Close()
@@ -548,5 +550,47 @@ func TestStoppingTheVideoServerEndsTheMCULiteData(t *testing.T) {
 	}
 	if _, err := dash.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
 		t.Fatalf("the MCU-Lite data socket outlived the video server: %v", err)
+	}
+}
+
+// The family's table is picked by the connection's opening, as CarbitRide picks it
+// (sdk/h0.java:104-407): a car connection keeps the car's empty cmd+1 for an unknown even command
+// whatever its number, and an MCU, VM or MCU-Lite connection answers from its own table, car
+// commands included.
+func TestTheConnectionsOpeningPicksTheHandlerTable(t *testing.T) {
+	for _, tc := range []struct {
+		opening, cmd uint32
+		body         string
+		want         uint32
+		wantBody     string
+	}{
+		{PxcHandshake, 0x1050022, "", 0x1050023, ""},
+		{PxcHandshake, 0x1050010, `{"version":"1"}`, 0x1050011, ""},
+		{PxcHandshake, 0x1060040, "", 0x1060041, ""},
+		{PxcHandshake, 0x1080050, "", 0x1080051, ""},
+		{PxcChannelCarData, 0x1060010, `{"project_type":7}`, 0x1060011, ""},
+		{0x1050000, 0x1050010, "", 0x1050011, `{"useVirtualMachine":false}`},
+		{0x1050000, 0x1050022, "", PxcStatusUnsupported, ""},
+		{0x1050000, PxcDashButton, `{"code":4160,"type":2}`, PxcStatusUnsupported, ""},
+		{0x1060000, 0x1060040, "", PxcStatusUnsupported, ""},
+		{0x1060000, 0x1050010, "", PxcStatusUnsupported, ""},
+		{MCULiteChannelC2P, 0x1080050, "", PxcStatusUnsupported, ""},
+		{MCULiteChannelC2P, PxcDashButton, `{"code":4160,"type":2}`, PxcStatusUnsupported, ""},
+	} {
+		control := NewPXCControl(":0", nil, nil)
+		control.SetMCULite(NewMCULite())
+		car, dash := stdnet.Pipe()
+		servePXCConn(t, control, car)
+		_ = dash.SetDeadline(time.Now().Add(2 * time.Second))
+		writeDashFrame(t, dash, tc.opening, nil)
+		readPXCResponse(t, dash)
+		writeDashFrame(t, dash, tc.cmd, []byte(tc.body))
+		if got := readPXCResponse(t, dash); got.Command != tc.want || string(got.Body) != tc.wantBody {
+			t.Fatalf("opened 0x%x, 0x%x answered 0x%x %q, want 0x%x %q", tc.opening, tc.cmd, got.Command, got.Body, tc.want, tc.wantBody)
+		}
+		_ = dash.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+		_ = control.Stop(ctx)
+		cancel()
 	}
 }

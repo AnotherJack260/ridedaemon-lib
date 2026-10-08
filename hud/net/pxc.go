@@ -526,6 +526,9 @@ type pxcConnectionState struct {
 	dashBeats atomic.Bool
 	// mcuWatched: MCULite.watch has a watcher on this connection.
 	mcuWatched atomic.Bool
+	// opening is the first command the dash sent on this connection; its top bits say which
+	// EasyConn family the connection belongs to (serveOtherFamily).
+	opening atomic.Uint32
 }
 
 func NewPXCControl(port string, kp *KeyPair, config *PhoneConfig) *PXCControl {
@@ -1061,6 +1064,7 @@ func (s *PXCControl) startChannelHeartbeat(conn net.Conn, channel string) {
 }
 
 func (s *PXCControl) handleEvent(event *PXCResponse, conn net.Conn) {
+	s.connectionState(conn).opening.CompareAndSwap(0, event.Command)
 	if pxcIsReply(event.Command) && s.isPhoneConn(conn) {
 		s.deliverP2CReply(conn, event)
 	}
@@ -1206,11 +1210,11 @@ func (s *PXCControl) handleEvent(event *PXCResponse, conn net.Conn) {
 		// a rider's own diagnostics export can ever show the reply happened.
 		s.emitEvent(*response)
 	default:
-		if h := c2pHandler(event.Command); h != nil && event.Command&1 == 0 {
+		if s.serveOtherFamily(event, conn) {
+			// A connection the dash opened as MCU-Lite, MCU or VM is answered from that family's
+			// table, as CarbitRide answers it (transport_families.go); everything below is the car's.
+		} else if h := c2pHandler(event.Command); h != nil && event.Command&1 == 0 {
 			s.answerRegistered(h, event, conn)
-		} else if s.serveOtherFamily(event, conn) {
-			// The other EasyConn families sharing this port: MCU-Lite, MCU, VM (transport_families.go).
-			// Their command ranges (0x105-0x109 << 16) never meet the registry's car-family ones.
 		} else if event.Command == PxcTboxSerial && s.flavor51Defaults() {
 			// CarbitRide answers nothing to 0x102B0, not even an error (v0.f(),
 			// sdk/v0.java:77-80): a stray 0x102B1 can read as the answer to the dash's next

@@ -8,25 +8,29 @@ import (
 
 // The EasyConn families other than the car one share the PXC port; CarbitRide tells them apart by
 // the connection type the dash opens with (sdk/h0.java:104-407) and gives each its own handler
-// table on the same reader (sdk/b1.java). Here they are told apart by the command's top bits:
+// table on the same reader (sdk/b1.java). So does this: the top bits of the first command on the
+// connection (pxcConnectionState.opening) pick the table for every request on it.
 //
 //	0x101/0x102/0x103 LHU   no handlers; the channel openings get the default ack
 //	0x104/0x105       VM    PXCForVM (sdk/g0.java, sm/*): request channel 0x1050000
 //	0x106/0x107       MCU   PXCForMCU (sdk/d0.java, lm/*): request channel 0x1060000
 //	0x108/0x109       MCU-Lite, only when the host enabled it (transport_mcu_lite.go)
 //
+// A car connection (0x10000, 0x20000) keeps the car's answers whatever the command, so an unknown
+// even command there gets the empty cmd+1 it always has.
+//
 // CarbitRide 2.4 does nothing with any MCU or VM request (none of their callbacks is overridden in
 // ec/b.java), so those are answered exactly as it answers them and reach the host as events.
 
-// serveOtherFamily answers one of those requests and reports whether it did. Odd frames, the
-// channel openings and everything outside these families are left to the default branch, so the
-// car family's bytes on the wire do not change.
+// serveOtherFamily answers a request on a connection the dash opened as one of those families and
+// reports whether it did. Odd frames, the VM and MCU openings and every connection of another
+// family are left to the default branch, so the car family's bytes on the wire do not change.
 func (s *PXCControl) serveOtherFamily(event *PXCResponse, conn net.Conn) bool {
 	if event.Command&1 != 0 {
 		return false
 	}
 	var reply *PXCResponse
-	switch event.Command >> 16 {
+	switch s.connectionState(conn).opening.Load() >> 16 {
 	case 0x108, 0x109:
 		if s.mcuLite == nil {
 			return false
