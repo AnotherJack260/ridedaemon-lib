@@ -253,10 +253,10 @@ func coerceJSON(field reflect.Value, raw json.RawMessage) {
 	}
 }
 
-// optLong reads one raw JSON field the way JSONObject.optLong / getInt do: a number, or text
+// rawLong reads one raw JSON field the way JSONObject.optLong / getInt do: a number, or text
 // holding one, truncated as Number.longValue() truncates. ok is false for anything else,
 // absence included.
-func optLong(raw json.RawMessage) (value int64, ok bool) {
+func rawLong(raw json.RawMessage) (value int64, ok bool) {
 	var n json.Number
 	if len(raw) == 0 || json.Unmarshal(raw, &n) != nil {
 		return 0, false
@@ -319,7 +319,7 @@ const supportFunctionExMask = 0xFFBFFFDF
 // (CI:877-890, 1030-1036): supportFunctionEx & 0xFFBFFFDF and no supportFunction when the dash
 // sent an Ex; its supportFunction otherwise, 0 when it sent none (b0.O() for this build).
 func echoSupportFunction(conf *HUDConfig, pc *PhoneConfig) {
-	if ex, ok := optLong(conf.SupportFunctionEx); ok {
+	if ex, ok := rawLong(conf.SupportFunctionEx); ok {
 		masked := ex & supportFunctionExMask
 		pc.SupportFunction, pc.SupportFunctionEx = nil, &masked
 		return
@@ -332,7 +332,7 @@ func echoSupportFunction(conf *HUDConfig, pc *PhoneConfig) {
 // supportSpeechEngine, 2 when absent, and 2002 read as 2001 except on channel 16206 (XF06)
 // (CI:922-932, ec/b.java:566).
 func carbitSpeechEngineType(conf *HUDConfig) int {
-	engine, ok := optLong(conf.SupportSpeechEngine)
+	engine, ok := rawLong(conf.SupportSpeechEngine)
 	if !ok {
 		engine = 2
 	}

@@ -347,12 +347,12 @@ func answerSwitchToAppPage(s *PXCControl, req *PXCResponse) ([]byte, error) {
 		Channel json.RawMessage `json:"channel"`
 	}
 	_ = json.Unmarshal(req.Body, &page)
-	pageType, ok := optLong(page.Type)
+	pageType, ok := rawLong(page.Type)
 	if !ok {
 		logging.Printf("PXC SWITCH_TO_APP_PAGE without a page: %q", req.Body)
 		return nil, nil
 	}
-	channel, _ := optLong(page.Channel)
+	channel, _ := rawLong(page.Channel)
 	payload := make([]byte, 8)
 	binary.BigEndian.PutUint32(payload[0:], uint32(pageType))
 	binary.BigEndian.PutUint32(payload[4:], uint32(channel))
