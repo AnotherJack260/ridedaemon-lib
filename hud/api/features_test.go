@@ -327,7 +327,7 @@ func (l keyListener) OnDashKey(code, keyType, action int) {
 	l.keys <- [3]int{code, keyType, action}
 }
 
-// The session feeds its DashFeatures every PXC event, in the dash's order, on a worker: a
+// The session feeds its DashFeatures the feature commands, in the dash's order, on a worker: a
 // listener that blocks holds up neither relayEvent nor OnEvent, and nothing else is fed to it.
 func TestRelayEventFeedsTheFeaturesInOrderWithoutBlocking(t *testing.T) {
 	cb := eventsCallback{make(chan pxcEvent, 64)}
@@ -372,4 +372,128 @@ func TestRelayEventFeedsTheFeaturesInOrderWithoutBlocking(t *testing.T) {
 		t.Fatalf("a media-control event reached the features: %v", k)
 	case <-time.After(50 * time.Millisecond):
 	}
+}
+
+// naviListener reports OnNaviConfig once release is closed.
+type naviListener struct {
+	noListener
+	icons   chan int
+	release chan struct{}
+}
+
+func (l naviListener) OnNaviConfig(maxNaviIcon int) {
+	<-l.release
+	l.icons <- maxNaviIcon
+}
+
+func relayNaviConfig(session *MobileSession, maxNaviIcon int) {
+	session.relayEvent(core.HudEvent{Source: core.EventSourcePXC, Cmd: int(net.PxcNaviConfig),
+		Data: json.RawMessage(fmt.Sprintf(`{"maxNaviIcon":%d}`, maxNaviIcon))})
+}
+
+func queuedFeatureEvents(f *DashFeatures) int {
+	f.queueMu.Lock()
+	defer f.queueMu.Unlock()
+	return len(f.queue)
+}
+
+// awaitWorkerBusy waits until the worker has taken everything queued into the listener.
+func awaitWorkerBusy(t *testing.T, f *DashFeatures) {
+	t.Helper()
+	for deadline := time.Now().Add(time.Second); queuedFeatureEvents(f) != 0; time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the feature worker never took its first event")
+		}
+	}
+}
+
+func expectIcons(t *testing.T, icons chan int, want ...int) {
+	t.Helper()
+	for i, w := range want {
+		select {
+		case got := <-icons:
+			if got != w {
+				t.Fatalf("call %d: OnNaviConfig(%d), want %d", i, got, w)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("call %d (OnNaviConfig(%d)) never came", i, w)
+		}
+	}
+	select {
+	case got := <-icons:
+		t.Fatalf("OnNaviConfig(%d) after the expected calls", got)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+// A stuck listener: heartbeats and the other PXC traffic never enter the features' queue, and the
+// feature commands that do are bounded, the oldest dropped first.
+func TestAStuckFeatureListenerHoldsOnlyTheNewestFeatureCommands(t *testing.T) {
+	session := &MobileSession{}
+	release, icons := make(chan struct{}), make(chan int, 2*maxQueuedFeatureEvents)
+	f := NewDashFeatures(session, naviListener{icons: icons, release: release})
+	relayNaviConfig(session, 0)
+	awaitWorkerBusy(t, f)
+
+	for i := 0; i < 500; i++ {
+		session.relayEvent(core.HudEvent{Source: core.EventSourcePXC, Cmd: int(net.PxcHeartbeat)})
+		session.relayEvent(core.HudEvent{Source: core.EventSourcePXC, Cmd: int(net.PxcHeartbeatOk)})
+	}
+	session.relayEvent(core.HudEvent{Source: core.EventSourcePXC, Cmd: 0x10410, Data: json.RawMessage(`{}`)})
+	if n := queuedFeatureEvents(f); n != 0 {
+		t.Fatalf("%d events that are not feature commands were queued", n)
+	}
+	for n := 1; n <= 100; n++ {
+		relayNaviConfig(session, n)
+	}
+	if n := queuedFeatureEvents(f); n != maxQueuedFeatureEvents {
+		t.Fatalf("%d feature commands queued, want the bound %d", n, maxQueuedFeatureEvents)
+	}
+
+	close(release)
+	want := []int{0}
+	for n := 100 - maxQueuedFeatureEvents + 1; n <= 100; n++ {
+		want = append(want, n)
+	}
+	expectIcons(t, icons, want...)
+}
+
+// What a DashFeatures still has queued is discarded when NewDashFeatures replaces it and when the
+// session stops; the call already running finishes.
+func TestPendingFeatureCallsAreDiscardedOnReplacementAndStop(t *testing.T) {
+	session := &MobileSession{}
+	release, icons := make(chan struct{}), make(chan int, 8)
+	old := NewDashFeatures(session, naviListener{icons: icons, release: release})
+	relayNaviConfig(session, 1)
+	awaitWorkerBusy(t, old)
+	relayNaviConfig(session, 2)
+	relayNaviConfig(session, 3)
+
+	opened, newIcons := make(chan struct{}), make(chan int, 8)
+	close(opened)
+	NewDashFeatures(session, naviListener{icons: newIcons, release: opened})
+	close(release)
+	expectIcons(t, icons, 1)
+	relayNaviConfig(session, 4)
+	expectIcons(t, newIcons, 4)
+
+	stopping, err := NewMobileSession(NewMobileConfig(nil, 30, 5, 2, 1, 1), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	release, icons = make(chan struct{}), make(chan int, 8)
+	f := NewDashFeatures(stopping, naviListener{icons: icons, release: release})
+	relayNaviConfig(stopping, 5)
+	awaitWorkerBusy(t, f)
+	relayNaviConfig(stopping, 6)
+	if err := stopping.StopSession(); err != nil {
+		t.Fatal(err)
+	}
+	for deadline := time.Now().Add(time.Second); stopping.IsRunning(); time.Sleep(time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatal("the session never stopped")
+		}
+	}
+	close(release)
+	expectIcons(t, icons, 5)
 }

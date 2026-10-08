@@ -201,7 +201,8 @@ type MobileSession struct {
 
 	stopped chan struct{}
 
-	// features is the DashFeatures made for this session (NewDashFeatures); relayEvent feeds it.
+	// features is the DashFeatures made for this session (NewDashFeatures); relayEvent feeds it,
+	// and a stop or a newer DashFeatures discards what it has not handled yet.
 	features atomic.Pointer[DashFeatures]
 }
 
@@ -345,6 +346,9 @@ func (ms *MobileSession) relayEvent(evt core.HudEvent) {
 
 func (ms *MobileSession) watchHud() {
 	<-ms.hud.Done()
+	if f := ms.features.Load(); f != nil {
+		f.discard()
+	}
 	// notify callback
 	if ms.cb != nil {
 		go ms.cb.OnStopped()

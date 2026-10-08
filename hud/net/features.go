@@ -85,6 +85,12 @@ func init() {
 	})
 }
 
+// IsFeatureCommand reports a dash command DecodeFeatureCommand decodes.
+func IsFeatureCommand(cmd uint32) bool {
+	_, ok := featureDecoders[cmd]
+	return ok
+}
+
 // DecodeFeatureCommand decodes one dash command if it is a feature command. ok is false for
 // any other command.
 func DecodeFeatureCommand(cmd uint32, body []byte) (event any, ok bool, err error) {
