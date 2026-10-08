@@ -2,6 +2,7 @@ package core
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -118,6 +119,7 @@ type CfmotoHUD struct {
 	identityKey         *net.KeyPair
 	echoSupportFunction bool
 	speechEngineType    int
+	tlsCert             *tls.Certificate
 
 	// net management
 	keyPair      *net.KeyPair
@@ -230,6 +232,18 @@ func (hud *CfmotoHUD) SetPhoneIdentity(id PhoneIdentity) error {
 	}
 	hud.echoSupportFunction = id.EchoSupportFunction
 	hud.speechEngineType = id.SpeechEngineType
+	return nil
+}
+
+// SetTLSCertificate is what the phone serves when a dash asks for TLS on PXC (0x107C0). Without
+// one the dash is answered as before and the session stays plaintext. Call it before StartStream.
+func (hud *CfmotoHUD) SetTLSCertificate(cert tls.Certificate) error {
+	hud.mu.Lock()
+	defer hud.mu.Unlock()
+	if hud.running {
+		return errors.New("already running")
+	}
+	hud.tlsCert = &cert
 	return nil
 }
 
@@ -565,6 +579,9 @@ func (hud *CfmotoHUD) startStream(ctx context.Context, initConn stdnet.Conn) (er
 	pxcServer := net.NewPXCControl(":10922", hud.keyPair, hud.phoneConfig)
 	pxcServer.SetProactiveHeartbeat(hud.proactivePxcHeartbeat)
 	pxcServer.SetIdleProbe(hud.idleProbe)
+	if hud.tlsCert != nil {
+		pxcServer.SetTLSCertificate(*hud.tlsCert)
+	}
 	pxcServer.SetEchoSupportFunction(hud.echoSupportFunction)
 	pxcServer.SetSpeechEngineType(hud.speechEngineType)
 	pxcServer.SetPageSwitchProbe(hud.pageSwitchProbe)

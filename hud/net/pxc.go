@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -356,7 +357,9 @@ type PXCControl struct {
 	HudConfig   *HUDConfig
 	PhoneConfig *PhoneConfig
 
-	connections        sync.Map // map[net.Conn]*pxcConnectionState
+	connections        sync.Map    // map[net.Conn]*pxcConnectionState
+	tlsConfig          *tls.Config // what the phone serves on 0x107C0; nil: stay plaintext
+	tlsOn              atomic.Bool // this session switched to TLS; new phone channels follow
 	heartbeatInterval  time.Duration
 	proactiveHeartbeat bool
 	idleProbe          bool
@@ -496,9 +499,13 @@ type pxcConnectionState struct {
 	channel     atomic.Value // string: "CAR_CTRL" | "CAR_DATA"
 	lastRxNanos atomic.Int64
 	beatsSince  atomic.Int64 // keepalives written since the dash last said anything
-	// superseded marks a phone channel the dash replaced with a newer one, so its closing is
-	// not reported as a failure.
+	// superseded marks a connection closed on purpose - a phone channel the dash replaced with a
+	// newer one, or one whose TLS switch failed and was reported - so its closing is not reported
+	// as a failure.
 	superseded atomic.Bool
+	// reader is the connection's buffered reader, owned by its read loop; a TLS switch takes over
+	// what it has buffered.
+	reader *bufio.Reader
 	// answered: the dash has answered a command of ours on this phone channel.
 	answered atomic.Bool
 	// dashBeats: the dash keeps this channel alive with heartbeats of its own.
@@ -919,22 +926,7 @@ func (s *PXCControl) writeResponse(res *PXCResponse, conn net.Conn, raw *[]byte)
 	defer state.writeMu.Unlock()
 
 	if raw == nil && res != nil {
-		// -- build header
-		res.Token = 0 // Padding is always 0 for responses
-		res.Size = pxcHeaderSize
-		if len(res.Body) > 0 {
-			res.Size = res.Size + uint32(len(res.Body))
-		}
-		res.Magic = res.Size ^ res.Command
-
-		// Header and body in one write, as the official app flushes them (sdk/i.java:149-163):
-		// four header writes on a TCP_NODELAY socket went out as four segments.
-		frame := make([]byte, pxcHeaderSize, int(res.Size))
-		binary.LittleEndian.PutUint32(frame[0:], res.Command)
-		binary.LittleEndian.PutUint32(frame[4:], res.Size)
-		binary.LittleEndian.PutUint32(frame[8:], res.Magic)
-		binary.LittleEndian.PutUint32(frame[12:], res.Token)
-		if _, err := conn.Write(append(frame, res.Body...)); err != nil {
+		if _, err := conn.Write(encodeFrame(res)); err != nil {
 			return err
 		}
 	} else if raw != nil {
@@ -944,6 +936,21 @@ func (s *PXCControl) writeResponse(res *PXCResponse, conn net.Conn, raw *[]byte)
 	}
 
 	return nil
+}
+
+// encodeFrame fills in res's header and returns header and body as one frame: one write, as the
+// official app flushes them (sdk/i.java:149-163) - four header writes on a TCP_NODELAY socket went
+// out as four segments.
+func encodeFrame(res *PXCResponse) []byte {
+	res.Token = 0 // Padding is always 0 for responses
+	res.Size = pxcHeaderSize + uint32(len(res.Body))
+	res.Magic = res.Size ^ res.Command
+	frame := make([]byte, pxcHeaderSize, int(res.Size))
+	binary.LittleEndian.PutUint32(frame[0:], res.Command)
+	binary.LittleEndian.PutUint32(frame[4:], res.Size)
+	binary.LittleEndian.PutUint32(frame[8:], res.Magic)
+	binary.LittleEndian.PutUint32(frame[12:], res.Token)
+	return append(frame, res.Body...)
 }
 
 // Keep the dash's request channel (CAR_CTRL) alive with empty 0x70000000 frames, for firmware
@@ -999,6 +1006,9 @@ func (s *PXCControl) handleEvent(event *PXCResponse, conn net.Conn) {
 		// Named before it is answered, not after: a write that fails here produces an error whose
 		// whole value is saying WHICH channel could not be answered.
 		s.nameChannel(conn, "CAR_CTRL")
+		// A new request channel starts plaintext, and so do phone channels opened after it until
+		// it asks again (sdk/h0.java:104-112).
+		s.tlsOn.Store(false)
 		// Emitted so a rider's log shows which channels the dash opened at all - their
 		// absence from every export is what let phone commands go out on the wrong one.
 		s.emitEvent(*event)
@@ -1013,7 +1023,13 @@ func (s *PXCControl) handleEvent(event *PXCResponse, conn net.Conn) {
 		s.nameChannel(conn, "CAR_DATA")
 		s.emitEvent(*event)
 		response := &PXCResponse{Command: PxcChannelCarData + 1}
-		if err := s.writeResponse(response, conn, nil); err != nil {
+		if s.tlsOn.Load() {
+			// The plaintext 0x20001, then TLS, before anything of ours goes out on it: CarbitRide's
+			// P2C sender switches its socket when it starts (sdk/x0.java:175, h0.java:122-133).
+			if !s.switchToTLS(conn, response) {
+				return
+			}
+		} else if err := s.writeResponse(response, conn, nil); err != nil {
 			s.emitError(s.connectionError(conn, PxcWriteErr, err))
 			return
 		}
@@ -1028,6 +1044,8 @@ func (s *PXCControl) handleEvent(event *PXCResponse, conn net.Conn) {
 		s.announceAppStatus()
 	case PxcHudConf:
 		s.answerClientInfo(event, conn)
+	case PxcStartTLS:
+		s.answerStartTLS(event, conn)
 	case PxcSpeedConf:
 		s.emitEvent(*event)
 		response := &PXCResponse{Command: PxcSpeedOk}
@@ -1260,7 +1278,7 @@ func (s *PXCControl) acceptLoop() {
 
 		logging.Printf("New PXC client from %s", conn.RemoteAddr())
 		s.wg.Add(1)
-		go s.handleConn(conn)
+		go s.handleConn(&pxcConn{Conn: conn})
 	}
 }
 
@@ -1276,6 +1294,7 @@ func (s *PXCControl) handleConn(conn net.Conn) {
 	}()
 
 	reader := bufio.NewReader(conn)
+	state.reader = reader
 
 	// Retire the connection before judging the failure, never after. When the
 	// dash really goes away every channel fails at once, and whichever one is

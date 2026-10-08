@@ -1,15 +1,23 @@
 package net
 
 import (
+	"bytes"
 	"crypto/rand"
 	"crypto/rsa"
+	"crypto/tls"
 	"crypto/x509"
 	"encoding/base64"
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"math/big"
+	"net"
 	"strings"
+	"sync/atomic"
+	"time"
+
+	"github.com/charliecharlieO-o/ridedaemon-go/internal/logging"
 )
 
 type KeyPair struct {
@@ -189,4 +197,138 @@ func LegacyPublicDecryptPKCS1v15(pub *rsa.PublicKey, ciphertext []byte) ([]byte,
 
 	// Message is everything after the 0x00 separator
 	return em[i+1:], nil
+}
+
+// TLS on PXC (0x107C0).
+//
+// A dash with enableSockServerAuth asks for it with 0x107C0 on its request channel. CarbitRide
+// answers 00 00 00 02 in plaintext, then turns that socket into the server end of a TLS session
+// (TLSv1.2/1.3, no client certificate), and does the same to every phone channel opened after it,
+// right after the plaintext 0x20001; a new request channel starts plaintext again (km/u.java:
+// 19-29, sdk/b1.java:163-167, sdk/x0.java:175, sdk/e1.java:57-75, sdk/h0.java:104-112).
+//
+// Its certificate is a PKCS12 inside its APK. This library ships none: the host supplies one
+// (SetTLSCertificate), and without it the dash gets the empty 0x107C1 every earlier build sent.
+// The XOR of video lengths with a token that comes with it (base/q0.java:191-208) is not done:
+// the token this side announces in CLIENT_INFO is always 0, which makes that XOR a no-op.
+
+// PxcStartTLS is the dash asking for TLS on PXC (km/u.java).
+const PxcStartTLS uint32 = 0x107C0
+
+// pxcStartTLSOK is the reply body that says yes (km/u.java:22-27).
+var pxcStartTLSOK = []byte{0, 0, 0, 2}
+
+// tlsHandshakeTimeout bounds the switch; e1 uses the socket's own timeout (sdk/e1.java:20-31).
+const tlsHandshakeTimeout = 10 * time.Second
+
+// ParseTLSCertificate reads the certificate the phone serves PXC TLS with: the certificate chain
+// as PEM blocks or one DER certificate, and its private key as PEM or DER (PKCS#8, PKCS#1, SEC1).
+// A PKCS12 is opened by the host (java.security.KeyStore) and passed as these two.
+func ParseTLSCertificate(cert, key []byte) (tls.Certificate, error) {
+	return tls.X509KeyPair(asPEM(cert, "CERTIFICATE"), asPEM(key, "PRIVATE KEY"))
+}
+
+// asPEM leaves PEM alone and wraps DER; tls.X509KeyPair tries every key encoding on the bytes.
+func asPEM(b []byte, blockType string) []byte {
+	if block, _ := pem.Decode(b); block != nil {
+		return b
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: blockType, Bytes: b})
+}
+
+// SetTLSCertificate is what the phone serves when a dash asks for TLS. Configure it before Start.
+func (s *PXCControl) SetTLSCertificate(cert tls.Certificate) {
+	s.tlsConfig = &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   tls.VersionTLS12,
+		MaxVersion:   tls.VersionTLS13,
+	}
+}
+
+// pxcConn is an accepted PXC socket that can switch to TLS part-way through while staying the
+// same key for everything that tracks it.
+type pxcConn struct {
+	net.Conn // the socket itself: addresses, deadlines, Close
+	secure   atomic.Pointer[tls.Conn]
+}
+
+func (c *pxcConn) Read(b []byte) (int, error) {
+	if t := c.secure.Load(); t != nil {
+		return t.Read(b)
+	}
+	return c.Conn.Read(b)
+}
+
+func (c *pxcConn) Write(b []byte) (int, error) {
+	if t := c.secure.Load(); t != nil {
+		return t.Write(b)
+	}
+	return c.Conn.Write(b)
+}
+
+// prefixedConn reads what the connection's reader had already buffered before the socket.
+type prefixedConn struct {
+	net.Conn
+	r io.Reader
+}
+
+func (c *prefixedConn) Read(b []byte) (int, error) { return c.r.Read(b) }
+
+// answerStartTLS answers 0x107C0; see the note above.
+func (s *PXCControl) answerStartTLS(event *PXCResponse, conn net.Conn) {
+	s.emitEvent(*event)
+	if s.tlsConfig == nil {
+		logging.Printf("PXC: the dash asked for TLS (0x%x) and the app supplied no certificate; answering an empty 0x%x and staying plaintext",
+			PxcStartTLS, PxcStartTLS+1)
+		s.emitTransport(int(PxcStartTLS), []byte{0})
+		if err := s.writeResponse(&PXCResponse{Command: PxcStartTLS + 1}, conn, nil); err != nil {
+			s.emitError(s.connectionError(conn, PxcWriteErr, err))
+		}
+		return
+	}
+	reply := &PXCResponse{Command: PxcStartTLS + 1, Body: pxcStartTLSOK}
+	if !s.switchToTLS(conn, reply) {
+		return
+	}
+	s.tlsOn.Store(true)
+	s.emitEvent(*reply)
+	s.emitTransport(int(PxcStartTLS), []byte{1})
+}
+
+// switchToTLS writes reply in plaintext and makes conn the server end of a TLS session, both
+// under the connection's write lock so no other frame can slip between them. Bytes the dash sent
+// behind its request are already in the connection's reader and reach the handshake first. On
+// failure the connection is reported and closed; it reports whether conn is now TLS.
+func (s *PXCControl) switchToTLS(conn net.Conn, reply *PXCResponse) bool {
+	state := s.connectionState(conn)
+	err := func() error {
+		c, ok := conn.(*pxcConn)
+		if !ok || state.reader == nil {
+			return errors.New("this connection cannot switch to TLS")
+		}
+		state.writeMu.Lock()
+		defer state.writeMu.Unlock()
+		if _, err := c.Conn.Write(encodeFrame(reply)); err != nil {
+			return err
+		}
+		buffered, _ := state.reader.Peek(state.reader.Buffered())
+		pending := bytes.NewReader(append([]byte(nil), buffered...))
+		secure := tls.Server(&prefixedConn{Conn: c.Conn, r: io.MultiReader(pending, c.Conn)}, s.tlsConfig)
+		_ = c.Conn.SetDeadline(time.Now().Add(tlsHandshakeTimeout))
+		defer func() { _ = c.Conn.SetDeadline(time.Time{}) }()
+		if err := secure.Handshake(); err != nil {
+			return err
+		}
+		c.secure.Store(secure)
+		state.reader.Reset(c)
+		return nil
+	}()
+	if err == nil {
+		logging.Printf("PXC: %v is TLS now", conn.RemoteAddr())
+		return true
+	}
+	s.emitError(s.connectionError(conn, PxcWriteErr, fmt.Errorf("TLS after 0x%x: %w", reply.Command, err)))
+	state.superseded.Store(true) // reported here; its read loop ends without a second report
+	_ = conn.Close()
+	return false
 }

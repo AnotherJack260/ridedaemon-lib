@@ -1,6 +1,9 @@
 package api
 
-import "github.com/charliecharlieO-o/ridedaemon-go/hud/core"
+import (
+	"github.com/charliecharlieO-o/ridedaemon-go/hud/core"
+	"github.com/charliecharlieO-o/ridedaemon-go/hud/net"
+)
 
 // Control-plane API: what the host can tell the dash, or about itself, beyond the video. The
 // transport events these produce are listed in hud/core (TransportCmd*) and hud/net (Pxc*).
@@ -86,4 +89,20 @@ func (ms *MobileSession) SetPhoneIdentity(id *PhoneIdentity) error {
 // default. Call it before StartSession.
 func (ms *MobileSession) SetIdleProbe(enabled bool) {
 	ms.hud.SetIdleProbe(enabled)
+}
+
+// SetTLSCertificate supplies the certificate the phone serves when a dash asks for TLS on PXC
+// (0x107C0): the request channel and the phone channels opened after it switch to TLS 1.2/1.3
+// with the phone as server, as the official app does. cert is the chain as PEM or one DER
+// certificate; key its private key as PEM or DER (PKCS#8, PKCS#1 or EC). For a PKCS12 file,
+// open it with java.security.KeyStore("PKCS12") and pass getCertificate(alias).encoded and
+// getKey(alias, password).encoded. Without a certificate the dash is answered as before and the
+// session stays plaintext (transport event 0x107C0 payload [0] says it asked). Call it before
+// StartSession.
+func (ms *MobileSession) SetTLSCertificate(cert []byte, key []byte) error {
+	parsed, err := net.ParseTLSCertificate(cert, key)
+	if err != nil {
+		return err
+	}
+	return ms.hud.SetTLSCertificate(parsed)
 }
