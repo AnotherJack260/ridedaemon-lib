@@ -381,6 +381,38 @@ func TestReleaseDashSendsStopServiceWhenTheFirstGoesUnanswered(t *testing.T) {
 	}
 }
 
+// The dash reopens its phone channel while switchEc2Background waits: STOP_SERVICE goes out on the
+// new one, and when that goes unanswered too it is the new one that is retired, not only the
+// replaced one, so no late answer to the pair can reach a later command.
+func TestReleaseDashRetiresTheChannelItsUnansweredCommandsWentOn(t *testing.T) {
+	control := NewPXCControl(":0", nil, nil)
+	_, first := openPhoneChannel(t, control)
+	done := make(chan error, 1)
+	go func() { done <- control.ReleaseDash() }()
+	if got := readPXCResponse(t, first); got.Command != PxcSwitchEcToBackground {
+		t.Fatalf("first: 0x%x", got.Command)
+	}
+	_, second := openPhoneChannel(t, control)
+	_ = second.SetDeadline(time.Now().Add(5 * time.Second))
+	if got := readPXCResponse(t, second); got.Command != PxcStopService {
+		t.Fatalf("on the reopened channel: 0x%x", got.Command)
+	}
+	select {
+	case err := <-done:
+		if !errors.Is(err, ErrPhoneCommandTimeout) {
+			t.Fatalf("ReleaseDash() = %v, want ErrPhoneCommandTimeout", err)
+		}
+	case <-time.After(4 * time.Second):
+		t.Fatal("ReleaseDash() never returned")
+	}
+	if control.phoneChannel() != nil {
+		t.Fatal("the channel STOP_SERVICE went unanswered on is still the phone channel")
+	}
+	if _, err := second.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+		t.Fatalf("the reopened channel was kept for a late answer: %v", err)
+	}
+}
+
 func TestReleaseDashWithoutPhoneChannelSaysSo(t *testing.T) {
 	control := NewPXCControl(":0", nil, nil)
 	if err := control.ReleaseDash(); !errors.Is(err, ErrNoPhoneChannel) {

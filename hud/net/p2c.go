@@ -215,9 +215,10 @@ func (s *PXCControl) runP2C() {
 
 // runP2CChain sends req and the requests chained to it (then), back to back. A request with its own
 // wait that ran out of it went unanswered all the same: its answer can still come, and once the
-// chain is done the channel it went out on is retired for that, as for any unanswered command.
+// chain is done the channel it went out on - each exchange takes the newest - is retired for that,
+// as for any unanswered command.
 func (s *PXCControl) runP2CChain(req *p2cRequest) {
-	conn, unanswered := s.phoneChannel(), false
+	var unanswered []net.Conn
 	for ; req != nil; req = req.then {
 		if s.isStopping() {
 			req.done <- p2cResult{err: errSessionStopping}
@@ -227,11 +228,20 @@ func (s *PXCControl) runP2CChain(req *p2cRequest) {
 			req.done <- p2cResult{err: errPhoneCommandExpired}
 			continue
 		}
-		reply, err := s.p2cExchange(req.cmd, req.body, req.wait, req.onWritten)
-		unanswered = unanswered || (req.wait > 0 && errors.Is(err, ErrPhoneCommandTimeout))
+		var sentOn net.Conn
+		onWritten := func(conn net.Conn, err error) {
+			sentOn = conn
+			if req.onWritten != nil {
+				req.onWritten(conn, err)
+			}
+		}
+		reply, err := s.p2cExchange(req.cmd, req.body, req.wait, onWritten)
+		if req.wait > 0 && sentOn != nil && errors.Is(err, ErrPhoneCommandTimeout) {
+			unanswered = append(unanswered, sentOn)
+		}
 		req.done <- p2cResult{reply: reply, err: err}
 	}
-	if unanswered && conn != nil {
+	for _, conn := range unanswered {
 		s.retire(conn, errors.New("a command went unanswered on the phone channel within its own wait"))
 	}
 }
