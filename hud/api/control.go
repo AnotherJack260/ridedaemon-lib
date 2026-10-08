@@ -24,8 +24,8 @@ func (ms *MobileSession) SetAppForeground(foreground bool) {
 
 // SetFlavor51Lifecycle controls what a flavor-51 dash (CarbitRide's family, the Zontes 350D among
 // them) gets without the profile asking: the APPSTATUS announcements AppStatusNotifyEnabled
-// turns on for any dash, and switchEc2Front (0x201D0) when the dash starts the stream. On by
-// default; false restores the earlier wire. Call it before StartSession.
+// turns on for any dash, switchEc2Front (0x201D0) when the dash starts the stream, and no reply
+// to 0x102B0. On by default; false restores the earlier wire. Call it before StartSession.
 func (ms *MobileSession) SetFlavor51Lifecycle(enabled bool) {
 	ms.hud.SetFlavor51Lifecycle(enabled)
 }
@@ -79,4 +79,11 @@ func (ms *MobileSession) SetPhoneIdentity(id *PhoneIdentity) error {
 		EchoSupportFunction: id.EchoSupportFunction,
 		SpeechEngineType:    id.SpeechEngineType,
 	})
+}
+
+// SetIdleProbe makes the phone channel's keepalive carry the official app's cmd-0 probe on its
+// first idle tick after a command and every 7th after it; the dash answers 0x80000010. Off by
+// default. Call it before StartSession.
+func (ms *MobileSession) SetIdleProbe(enabled bool) {
+	ms.hud.SetIdleProbe(enabled)
 }

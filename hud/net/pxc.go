@@ -50,6 +50,10 @@ const (
 	PxcOtaFtpInfo       uint32 = 0x103a0
 	PxcMediaFeatureConf uint32 = 0x10020
 	PxcCheckSnResult    uint32 = 0x201c0
+	// PxcTboxSerial is the dash stating its T-Box serial, {"tbox":{"sn":...}} (km/d.java).
+	PxcTboxSerial uint32 = 0x102b0
+	// PxcCarSupportCmds is ECP_C2P_CAR_SUPPORT_CMDS, a JSON object (km/h.java).
+	PxcCarSupportCmds uint32 = 0x10470
 	// The dash asks the phone what time it is. The default branch below would
 	// already answer this with an empty cmd+1, which is what shipped until now;
 	// naming it lets the reply carry the timestamp the request is asking for.
@@ -85,6 +89,19 @@ var pxcCannedReplies = map[uint32]json.RawMessage{
 	0x10750: json.RawMessage(`{"status":0}`),
 	// A text the dash wants shown on the phone; answered {} (km/l0.java:22-31).
 	0x104E0: json.RawMessage(`{}`),
+}
+
+func init() {
+	// CarbitRide parses the list and does nothing else with it - ec/b.java has no G() override -
+	// so the empty ack is its whole answer; a body that is not a JSON object is a handler error
+	// (km/h.java:22-36). The request itself reaches the host's event stream as usual.
+	RegisterC2PHandler(PxcCarSupportCmds, func(_ *PXCControl, req *PXCResponse) ([]byte, error) {
+		if len(req.Body) == 0 {
+			return nil, nil
+		}
+		var cmds map[string]json.RawMessage
+		return nil, json.Unmarshal(req.Body, &cmds)
+	})
 }
 
 type checkSnRequest struct {
@@ -342,6 +359,7 @@ type PXCControl struct {
 	connections        sync.Map // map[net.Conn]*pxcConnectionState
 	heartbeatInterval  time.Duration
 	proactiveHeartbeat bool
+	idleProbe          bool
 	timeZoneID         string
 	timeZoneOffsetSec  int
 	timeZoneOffsetSet  bool
@@ -705,10 +723,15 @@ func (s *PXCControl) flavor51() bool {
 
 // SetFlavor51Lifecycle controls what a flavor-51 dash gets without any profile asking: the
 // official app's APPSTATUS announcements and its switch to the mirror page at stream start
-// (carbitLifecycle). On by default; false restores the wire every earlier build put in front of
-// that dash. Configure it before Start.
+// (carbitLifecycle), and its silence on 0x102B0. On by default; false restores the wire every
+// earlier build put in front of that dash. Configure it before Start.
 func (s *PXCControl) SetFlavor51Lifecycle(enabled bool) {
 	s.noFlavor51Lifecycle = !enabled
+}
+
+// flavor51Defaults reports a flavor-51 dash the host has not opted out of SetFlavor51Lifecycle.
+func (s *PXCControl) flavor51Defaults() bool {
+	return !s.noFlavor51Lifecycle && s.flavor51()
 }
 
 // carbitLifecycle reports whether this dash gets the official app's unsolicited lifecycle
@@ -718,7 +741,7 @@ func (s *PXCControl) carbitLifecycle() bool {
 	s.appStatus.mu.Lock()
 	enabled := s.appStatus.enabled
 	s.appStatus.mu.Unlock()
-	return enabled || (!s.noFlavor51Lifecycle && s.flavor51())
+	return enabled || s.flavor51Defaults()
 }
 
 func (s *PXCControl) connectionState(conn net.Conn) *pxcConnectionState {
@@ -1104,6 +1127,13 @@ func (s *PXCControl) handleEvent(event *PXCResponse, conn net.Conn) {
 	default:
 		if h := c2pHandler(event.Command); h != nil && event.Command&1 == 0 {
 			s.answerRegistered(h, event, conn)
+		} else if event.Command == PxcTboxSerial && s.flavor51Defaults() {
+			// CarbitRide answers nothing to 0x102B0, not even an error (v0.f(),
+			// sdk/v0.java:77-80): a stray 0x102B1 can read as the answer to the dash's next
+			// request. Only for flavor 51: the body reads like a CFMOTO T-Box notice, and CFDL26
+			// waits for cmd+1 on the notices it sends.
+			logging.Printf("PXC 0x%x from a flavor-51 dash: not answered, as the official app does not", event.Command)
+			s.emitEvent(*event)
 		} else if event.Command&1 == 0 {
 			// Unknown even commands are requests. CFDL26 uses several JSON and
 			// binary notifications here and will not open 10921/10920 until ACKed.

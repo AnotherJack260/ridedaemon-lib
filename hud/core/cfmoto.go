@@ -100,6 +100,7 @@ type CfmotoHUD struct {
 	phoneConfig           *net.PhoneConfig
 	supportFunction       int
 	proactivePxcHeartbeat bool
+	idleProbe             bool
 	plainVideoFraming     bool
 	pageSwitchProbe       bool
 	jpegStills            bool
@@ -238,6 +239,14 @@ func (hud *CfmotoHUD) SetProactivePxcHeartbeat(enabled bool) {
 	hud.mu.Lock()
 	defer hud.mu.Unlock()
 	hud.proactivePxcHeartbeat = enabled
+}
+
+// SetIdleProbe enables CarbitRide's cmd-0 probe on the phone channel. See
+// net.PXCControl.SetIdleProbe. Configure it before StartStream.
+func (hud *CfmotoHUD) SetIdleProbe(enabled bool) {
+	hud.mu.Lock()
+	defer hud.mu.Unlock()
+	hud.idleProbe = enabled
 }
 
 // SetPlainVideoFramingAllowed lets a dash that reports supportExtendProtocol=0 pull
@@ -555,6 +564,7 @@ func (hud *CfmotoHUD) startStream(ctx context.Context, initConn stdnet.Conn) (er
 	pxcReady := make(chan any, 1)
 	pxcServer := net.NewPXCControl(":10922", hud.keyPair, hud.phoneConfig)
 	pxcServer.SetProactiveHeartbeat(hud.proactivePxcHeartbeat)
+	pxcServer.SetIdleProbe(hud.idleProbe)
 	pxcServer.SetEchoSupportFunction(hud.echoSupportFunction)
 	pxcServer.SetSpeechEngineType(hud.speechEngineType)
 	pxcServer.SetPageSwitchProbe(hud.pageSwitchProbe)

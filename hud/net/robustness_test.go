@@ -271,3 +271,60 @@ func TestEveryZontesCommandIsAnsweredLikeTheOfficialApp(t *testing.T) {
 		})
 	}
 }
+
+// CAR_SUPPORT_CMDS is acked empty, or answered 0x80000020 when the body is not a JSON object,
+// as km/h.java:22-36 does.
+func TestCarSupportCmdsIsAnsweredLikeTheOfficialApp(t *testing.T) {
+	for _, tc := range []struct {
+		name, body string
+		want       uint32
+	}{
+		{"a JSON object", `{"cmds":[131344,131600]}`, PxcCarSupportCmds + 1},
+		{"no body", ``, PxcCarSupportCmds + 1},
+		{"not JSON", `131344,131600`, PxcStatusError},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			control := NewPXCControl(":0", nil, nil)
+			got := handlePXCEventAndReadResponses(t, control, &PXCResponse{Command: PxcCarSupportCmds, Body: json.RawMessage(tc.body)}, 1)[0]
+			if got.Command != tc.want || (tc.want != PxcStatusError && len(got.Body) != 0) {
+				t.Fatalf("reply = 0x%x %q, want 0x%x", got.Command, got.Body, tc.want)
+			}
+		})
+	}
+}
+
+// The official app answers nothing to 0x102B0 (sdk/v0.java:77-80). A flavor-51 dash gets that
+// silence; every other dash keeps the cmd+1 CFDL26-style firmware waits for.
+func TestTboxSerialIsAnsweredOnlyOffFlavor51(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		flavor string
+		optOut bool
+		reply  bool
+	}{
+		{"Zontes, flavor 51", `51`, false, false},
+		{"flavor 51, host opted out", `51`, true, true},
+		{"CFMOTO-style dash", `3`, false, true},
+		{"no CLIENT_INFO yet", ``, false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			control := NewPXCControl(":0", nil, nil)
+			control.SetFlavor51Lifecycle(!tc.optOut)
+			if tc.flavor != "" {
+				control.HudConfig = &HUDConfig{Flavor: json.RawMessage(tc.flavor)}
+			}
+			client, server := stdnet.Pipe()
+			defer client.Close()
+			defer server.Close()
+			go control.handleEvent(&PXCResponse{Command: PxcTboxSerial, Body: []byte(`{"tbox":{"sn":"S1"}}`)}, client)
+			if !tc.reply {
+				assertSilent(t, server, "a flavor-51 dash after 0x102B0")
+				return
+			}
+			_ = server.SetReadDeadline(time.Now().Add(time.Second))
+			if got := readPXCResponse(t, server); got.Command != PxcTboxSerial+1 || len(got.Body) != 0 {
+				t.Fatalf("reply = 0x%x %q", got.Command, got.Body)
+			}
+		})
+	}
+}
